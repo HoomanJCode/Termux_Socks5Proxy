@@ -192,50 +192,72 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
 BUFFER_SIZE = 4096
 
 
+def recv_exact(sock, n):
+    """Read exactly n bytes from `sock`, looping until complete (or EOF).
+
+    TCP has no message boundaries, so a single recv() may return fewer
+    bytes than expected. Returns the bytes actually read (shorter than n
+    if the peer closed the connection early).
+    """
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break   # connection closed before n bytes arrived
+        data += chunk
+    return data
+
+
 def handle_client(client_socket):
     """Handle a single SOCKS5 client connection on its own thread."""
     try:
         # --- SOCKS5 handshake (client greeting) -----------------------------
         # First message: VER(1) NMETHODS(1) METHODS(NMETHODS) — max 257 bytes
-        data = client_socket.recv(262)
-        if not data or len(data) < 3:
+        data = recv_exact(client_socket, 2)      # VER + NMETHODS
+        if len(data) < 2 or data[0] != 0x05:
             client_socket.close()
             return
-
-        # Reject anything that is not SOCKS version 5
-        if data[0] != 0x05:
+        nmethods = data[1]
+        # Read the list of authentication methods the client offers
+        if len(recv_exact(client_socket, nmethods)) < nmethods:
             client_socket.close()
             return
 
         # Tell the client we picked "no authentication" (0x00)
-        client_socket.send(b'\x05\x00')
+        client_socket.sendall(b'\x05\x00')
 
         # --- SOCKS5 request ------------------------------------------------
         # Second message: VER(1) CMD(1) RSV(1) ATYP(1) ADDR(4..255) PORT(2)
-        request = client_socket.recv(262)
-        if not request or len(request) < 10:
+        header = recv_exact(client_socket, 4)    # VER + CMD + RSV + ATYP
+        if len(header) < 4:
             client_socket.close()
             return
 
-        # Parse the fixed header fields
-        ver = request[0]    # SOCKS version (should be 0x05)
-        cmd = request[1]    # command: CONNECT / BIND / UDP ASSOCIATE
-        atyp = request[3]   # address type: IPv4 / domain name / IPv6
+        ver = header[0]    # SOCKS version (should be 0x05)
+        cmd = header[1]    # command: CONNECT / BIND / UDP ASSOCIATE
+        atyp = header[3]   # address type: IPv4 / domain name / IPv6
 
-        # Parse the destination address + port according to ATYP
+        # Only the CONNECT command is supported — reject BIND (0x02) and
+        # UDP ASSOCIATE (0x03) with REP 0x07 (command not supported)
+        if ver != 0x05 or cmd != 0x01:
+            client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+            client_socket.close()
+            return
+
+        # Read the destination address + port according to ATYP
         if atyp == 0x01:    # IPv4 (4 bytes)
-            addr = socket.inet_ntoa(request[4:8])
-            port = struct.unpack('>H', request[8:10])[0]
-            offset = 10
+            addr = socket.inet_ntoa(recv_exact(client_socket, 4))
+            port = struct.unpack('>H', recv_exact(client_socket, 2))[0]
+            family = socket.AF_INET
         elif atyp == 0x03:  # Domain name (1 length byte + name)
-            domain_len = request[4]
-            addr = request[5:5+domain_len].decode('utf-8')
-            port = struct.unpack('>H', request[5+domain_len:7+domain_len])[0]
-            offset = 7 + domain_len
+            domain_len = recv_exact(client_socket, 1)[0]
+            addr = recv_exact(client_socket, domain_len).decode('utf-8')
+            port = struct.unpack('>H', recv_exact(client_socket, 2))[0]
+            family = socket.AF_INET   # the hostname is resolved by connect()
         elif atyp == 0x04:  # IPv6 (16 bytes)
-            addr = socket.inet_ntop(socket.AF_INET6, request[4:20])
-            port = struct.unpack('>H', request[20:22])[0]
-            offset = 22
+            addr = socket.inet_ntop(socket.AF_INET6, recv_exact(client_socket, 16))
+            port = struct.unpack('>H', recv_exact(client_socket, 2))[0]
+            family = socket.AF_INET6
         else:
             # Unknown address type -> drop the connection
             client_socket.close()
@@ -243,12 +265,13 @@ def handle_client(client_socket):
 
         # --- Connect to the requested target --------------------------------
         try:
-            target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            target_socket.settimeout(30)          # don't hang forever
+            target_socket = socket.socket(family, socket.SOCK_STREAM)
+            target_socket.settimeout(30)          # timeout only the connect
             target_socket.connect((addr, port))   # establish the connection
+            target_socket.settimeout(None)        # blocking once connected
         except Exception as e:
             # Send a failure reply (REP 0x01 = general failure) and give up
-            client_socket.send(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
             client_socket.close()
             return
 
@@ -259,7 +282,7 @@ def handle_client(client_socket):
         response = b'\x05\x00\x00\x01'
         response += socket.inet_aton(bind_addr)
         response += struct.pack('>H', bind_port)
-        client_socket.send(response)
+        client_socket.sendall(response)
 
         # --- Bidirectional traffic relay ------------------------------------
         def forward(src, dst):
@@ -269,7 +292,7 @@ def handle_client(client_socket):
                     data = src.recv(BUFFER_SIZE)
                     if not data:
                         break   # remote side closed the connection
-                    dst.send(data)
+                    dst.sendall(data)   # sendall: never silently truncates
             except:
                 pass            # connection reset / timeout — stop copying
             finally:
