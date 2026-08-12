@@ -178,6 +178,119 @@ PYEOF
 [ $? -eq 0 ] && ok "protocol suite passed" || bad "protocol suite failed"
 
 # ---------------------------------------------------------------------------
+echo "=== 4b. concurrent UDP clients (no packet loss) ==="
+SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+# Two UDP echo sinks (one per client) so replies are distinguishable
+sinks = []
+for _ in range(2):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('127.0.0.1', 0)); s.settimeout(0.2)
+    sinks.append(s)
+def sink_loop(s):
+    while True:
+        try: d, a = s.recvfrom(4096)
+        except socket.timeout: continue
+        except OSError: return
+        s.sendto(d, a)
+for s in sinks:
+    threading.Thread(target=sink_loop, args=(s,), daemon=True).start()
+
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      '19340', '127.0.0.1'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+time.sleep(1)
+chk("proxy starts", p.poll() is None)
+
+# Open a UDP association. src_ip is bound on both the TCP and UDP sockets so
+# the relay sees two genuinely different source addresses.
+def open_client(src_ip):
+    t = socket.create_connection(('127.0.0.1', 19340), timeout=5,
+                                 source_address=(src_ip, 0))
+    t.sendall(b'\x05\x01\x00')
+    assert t.recv(2) == b'\x05\x00'
+    t.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+    resp = t.recv(10)
+    bnd = struct.unpack('>H', resp[8:10])[0]
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind((src_ip, 0))      # send from the given source address
+    u.settimeout(6)
+    return t, u, bnd
+
+# Two concurrent clients from *different* source IPs (both loopback)
+c1 = open_client('127.0.0.1')
+c2 = open_client('127.0.0.2')
+
+# Interleave 60 datagrams per client; every one must come back intact
+N = 60
+hdr1 = b'\x00\x00\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', sinks[0].getsockname()[1])
+hdr2 = b'\x00\x00\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', sinks[1].getsockname()[1])
+for i in range(N):
+    c1[1].sendto(hdr1 + b'c1-%d' % i, ('127.0.0.1', c1[2]))
+    c2[1].sendto(hdr2 + b'c2-%d' % i, ('127.0.0.1', c2[2]))
+
+# Collect all replies on both sockets
+seen1, seen2, deadline = set(), set(), time.time() + 8
+while time.time() < deadline and (len(seen1) < N or len(seen2) < N):
+    for sock, seen in ((c1[1], seen1), (c2[1], seen2)):
+        try:
+            r, _ = sock.recvfrom(65536)
+            seen.add(r[10:])
+        except socket.timeout:
+            pass
+chk("client1 got all %d replies" % N, len(seen1) == N)
+chk("client2 got all %d replies" % N, len(seen2) == N)
+chk("no cross-talk: client1 payloads only",
+    all(r.startswith(b'c1-') for r in seen1) and len(seen1) == N)
+chk("no cross-talk: client2 payloads only",
+    all(r.startswith(b'c2-') for r in seen2) and len(seen2) == N)
+
+c1[0].close(); c2[0].close(); c1[1].close(); c2[1].close()
+
+# Same-IP clients (dante-style): UDP socket on the SAME local port as the
+# TCP connection, so the relay can tell the two associations apart.
+def open_client_sameport():
+    # pick a free UDP port, then reuse it as the TCP source port
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(('127.0.0.1', 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    t = socket.create_connection(('127.0.0.1', 19340), timeout=5,
+                                 source_address=('127.0.0.1', port))
+    t.sendall(b'\x05\x01\x00')
+    assert t.recv(2) == b'\x05\x00'
+    t.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+    resp = t.recv(10)
+    bnd = struct.unpack('>H', resp[8:10])[0]
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind(('127.0.0.1', port))   # same local port as the TCP connection
+    u.settimeout(6)
+    return t, u, bnd
+
+c3 = open_client_sameport()
+c4 = open_client_sameport()
+for tag, cli, hdr in (('c3', c3, hdr1), ('c4', c4, hdr2)):
+    cli[1].sendto(hdr + b'%s-first' % tag.encode(), ('127.0.0.1', cli[2]))
+    r, _ = cli[1].recvfrom(65536)
+    chk("%s: first datagram routed correctly" % tag, r[10:] == b'%s-first' % tag.encode())
+c3[0].close(); c4[0].close(); c3[1].close(); c4[1].close()
+
+p.terminate(); p.wait()
+for s in sinks: s.close()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "concurrent UDP suite passed" || bad "concurrent UDP suite failed"
+
+# ---------------------------------------------------------------------------
 echo "=== 5. IPv6 listener (skipped if no IPv6 loopback) ==="
 SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
 import os, socket, struct, subprocess, sys, time

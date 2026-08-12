@@ -418,6 +418,7 @@ import sys
 import struct
 import hmac
 import time
+import queue
 
 # Listening port: taken from the command line, defaulting to 1080
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
@@ -497,101 +498,207 @@ def recv_exact(sock, n):
     return data
 
 
-def udp_relay(udp_sock, client_addr, tcp_sock):
-    """Relay UDP datagrams for one client (RFC 1928 UDP ASSOCIATE).
+# ---------------------------------------------------------------------------
+# UDP ASSOCIATE relay (RFC 1928).
+#
+# A single dispatcher thread owns the shared UDP socket and reads every
+# datagram, then routes it to the right client's per-client queue. Each
+# client has its own relay thread that forwards its queued datagrams to the
+# target and sends the target's replies back to the client. Because only the
+# dispatcher calls recvfrom on the shared socket, concurrent clients can
+# never steal each other's packets.
+# ---------------------------------------------------------------------------
+udp_lock = threading.Lock()
+udp_bound = {}      # (client ip, client udp port) -> UdpAssociation
+udp_pending = {}    # client ip -> [UdpAssociation] (before the 1st datagram)
 
-    The client sends datagrams to our UDP socket, each prefixed with the
-    SOCKS5 UDP header (RSV FRAG ATYP ADDR PORT). We forward the payload to
-    the target and send replies back with the same header so the client
-    knows which destination each reply came from.
 
-    Runs on the client's own thread. A single shared UDP socket is used, so
-    this is simplest with one client at a time (the typical phone case).
-    NOTE: with two or more concurrent UDP clients, datagrams for the blocked
-    client can be picked up and dropped by another client's thread — packets
-    may be lost. Keep to one active UDP client for reliable delivery.
+class UdpAssociation:
+    """One UDP ASSOCIATE: the TCP association, its outbound queue, and the
+    socket used to reach the relayed target."""
+
+    def __init__(self, tcp_sock):
+        peer = tcp_sock.getpeername()
+        self.tcp_sock = tcp_sock
+        self.client_ip = peer[0]
+        self.tcp_peer_port = peer[1]
+        self.client_udp = None      # (ip, port) learned from the 1st datagram
+        self.queue = queue.Queue()  # datagrams routed here by the dispatcher
+        self.target = None          # socket toward the relayed target
+        self.dest = None            # (addr, port) that self.target talks to
+        self.reply_hdr = None       # ATYP + address bytes for reply headers
+        self.dest_port = 0
+        self.alive = True
+
+
+def _find_assoc(src):
+    """Map a datagram's source to its association (None if no match).
+
+    Once a client's first datagram reveals its UDP (ip, port), that exact
+    pair is bound to the association. Before that, the datagram is matched
+    to a pending association by IP — preferring the one whose TCP peer port
+    equals the UDP source port (what real SOCKS clients do), then the most
+    recent association as a fallback for same-IP clients.
+
+    Requirement for clients behind the same IP: bind each client's UDP
+    socket to a distinct source port (ideally the one matching its TCP
+    port). The first datagram binds the (ip, port) pair, so two same-IP
+    clients using the same UDP source port can only be told apart once
+    their datagrams have been seen.
     """
-    target = None
-    dest = None
-    # The client's UDP socket often uses a different port than its TCP
-    # connection, so match on IP and reply to the UDP source address.
-    client_ip = client_addr[0]
-    client_udp = None
-    udp_sock.settimeout(1.0)     # wake up periodically to check TCP side
-    tcp_sock.setblocking(False)
+    with udp_lock:
+        assoc = udp_bound.get(src)
+        if assoc is not None:
+            return assoc if assoc.alive else None
+        plist = udp_pending.get(src[0])
+        if not plist:
+            return None
+        match = None
+        for a in plist:
+            if a.alive and a.tcp_peer_port == src[1]:
+                match = a
+                break
+        if match is None:
+            for a in reversed(plist):   # most recent association wins
+                if a.alive:
+                    match = a
+                    break
+        if match is None:
+            return None
+        # Bind this (ip, port) to the association so later datagrams match
+        # exactly, and move it out of the pending list.
+        plist.remove(match)
+        if not plist:
+            del udp_pending[src[0]]
+        match.client_udp = src
+        udp_bound[src] = match
+        return match
+
+
+def udp_dispatcher():
+    """Single owner of the shared UDP socket: read every datagram and route
+    it to the right client's queue. Runs until the server socket closes."""
+    while True:
+        try:
+            data, src = udp_sock.recvfrom(65535)
+        except OSError:
+            return   # server socket closed — shutting down
+        assoc = _find_assoc(src)
+        if assoc is not None:
+            assoc.queue.put_nowait((data, src))   # unbounded — never drops
+
+
+def _relay_datagram(assoc, data, src):
+    """Parse one SOCKS5 UDP datagram and forward its payload to the target."""
+    if src != assoc.client_udp:
+        return   # datagram from an unexpected socket — drop it
+    if len(data) < 4 or data[2] != 0:
+        return   # FRAG != 0 (fragmentation) is unsupported
+    atyp = data[3]
+    try:
+        if atyp == 0x01:   # IPv4
+            addr = socket.inet_ntoa(data[4:8])
+            reply_hdr = data[3:8]           # ATYP + IPv4 address
+            family = socket.AF_INET
+            off = 8
+        elif atyp == 0x03:   # domain name
+            dlen = data[4]
+            addr = data[5:5 + dlen].decode('utf-8')
+            reply_hdr = data[3:5 + dlen]    # ATYP + len + name
+            family = socket.AF_INET
+            off = 5 + dlen
+        elif atyp == 0x04:   # IPv6
+            addr = socket.inet_ntop(socket.AF_INET6, data[4:20])
+            reply_hdr = data[3:20]          # ATYP + IPv6 address
+            family = socket.AF_INET6
+            off = 20
+        else:
+            return   # unknown address type
+        port = struct.unpack('>H', data[off:off + 2])[0]
+        payload = data[off + 2:]
+        # (Re)open the target socket when the destination changes.
+        # Non-blocking: replies are drained opportunistically below, so a
+        # slow target can never stall the relay (or its whole client queue).
+        if assoc.dest != (addr, port):
+            if assoc.target:
+                assoc.target.close()
+            assoc.target = socket.socket(family, socket.SOCK_DGRAM)
+            assoc.target.setblocking(False)
+            assoc.dest = (addr, port)
+            assoc.reply_hdr = reply_hdr
+            assoc.dest_port = port
+        assoc.target.sendto(payload, assoc.dest)
+    except (OSError, ValueError, IndexError):
+        pass   # malformed datagram — drop it
+
+
+def _drain_replies(assoc, block=0):
+    """Send replies waiting on the target socket back to the client, with
+    headers. Non-blocking by default; when `block` is non-zero, wait up to
+    that many seconds for the first reply (used when the client is idle, so
+    its replies arrive promptly instead of on the next poll)."""
+    target = assoc.target
+    if target is None or assoc.client_udp is None:
+        return
+    if block:
+        target.settimeout(block)
+    while True:
+        try:
+            resp, _ = target.recvfrom(65535)
+        except BlockingIOError:
+            return   # nothing waiting — done for now
+        except socket.timeout:
+            return
+        except OSError:
+            return
+        hdr = b'\x00\x00\x00' + assoc.reply_hdr + struct.pack('>H', assoc.dest_port)
+        try:
+            udp_sock.sendto(hdr + resp, assoc.client_udp)
+        except OSError:
+            return
+
+
+def udp_client_loop(assoc):
+    """Relay one client's UDP datagrams until its TCP association closes."""
+    tcp = assoc.tcp_sock
+    tcp.setblocking(False)
     try:
         while True:
-            # Closing the TCP association tears the UDP relay down
+            # Closing the TCP association tears the relay down
             try:
-                if tcp_sock.recv(1, socket.MSG_PEEK) == b'':
+                if tcp.recv(1, socket.MSG_PEEK) == b'':
                     break
             except (BlockingIOError, OSError):
                 pass
+            # Relay queued outbound datagrams, then drain any replies.
+            # (assoc.client_udp and assoc.alive are written by the dispatcher
+            # under udp_lock, but the queue handoff makes them visible here.)
             try:
-                data, src = udp_sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            # Re-check the TCP association now that a datagram arrived:
-            # the client may have closed it while we were blocked waiting
-            try:
-                if tcp_sock.recv(1, socket.MSG_PEEK) == b'':
-                    break
-            except (BlockingIOError, OSError):
-                pass
-            if src[0] != client_ip:
-                continue   # datagram from another client — ignore
-            if client_udp is None:
-                client_udp = src   # remember where the client listens
-            elif src != client_udp:
-                continue   # datagram from an unexpected UDP socket
-            if len(data) < 4 or data[2] != 0:
-                continue   # FRAG != 0 (fragmentation) is unsupported
-            atyp = data[3]
-            try:
-                if atyp == 0x01:   # IPv4
-                    addr = socket.inet_ntoa(data[4:8])
-                    reply_hdr = data[3:8]           # ATYP + IPv4 address
-                    family = socket.AF_INET
-                    off = 8
-                elif atyp == 0x03:   # domain name
-                    dlen = data[4]
-                    addr = data[5:5 + dlen].decode('utf-8')
-                    reply_hdr = data[3:5 + dlen]    # ATYP + len + name
-                    family = socket.AF_INET
-                    off = 5 + dlen
-                elif atyp == 0x04:   # IPv6
-                    addr = socket.inet_ntop(socket.AF_INET6, data[4:20])
-                    reply_hdr = data[3:20]          # ATYP + IPv6 address
-                    family = socket.AF_INET6
-                    off = 20
-                else:
-                    continue   # unknown address type
-                port = struct.unpack('>H', data[off:off + 2])[0]
-                payload = data[off + 2:]
-                # (Re)open the target socket when the destination changes
-                if dest != (addr, port):
-                    if target:
-                        target.close()
-                    target = socket.socket(family, socket.SOCK_DGRAM)
-                    target.settimeout(0.5)
-                    dest = (addr, port)
-                target.sendto(payload, dest)
-                # Forward any replies from the target back to the client
-                while True:
-                    try:
-                        resp, _ = target.recvfrom(65535)
-                    except socket.timeout:
-                        break
-                    udp_sock.sendto(
-                        b'\x00\x00\x00' + reply_hdr + struct.pack('>H', port) + resp,
-                        client_udp)
-            except (OSError, ValueError, IndexError):
-                continue   # malformed datagram — drop it
+                data, src = assoc.queue.get(timeout=0.05)
+            except queue.Empty:
+                data = None
+            if data is not None:
+                _relay_datagram(assoc, data, src)
+                _drain_replies(assoc)
+            else:
+                # Idle: wait briefly for a reply so it arrives at RTT speed
+                # instead of on the next poll, without stalling the loop
+                # while datagrams are still queued.
+                _drain_replies(assoc, block=0.1)
     except OSError:
         pass
     finally:
-        if target:
-            target.close()
+        assoc.alive = False
+        if assoc.target:
+            assoc.target.close()
+        with udp_lock:
+            if assoc.client_udp:
+                udp_bound.pop(assoc.client_udp, None)
+            plist = udp_pending.get(assoc.client_ip)
+            if plist and assoc in plist:
+                plist.remove(assoc)
+                if not plist:
+                    del udp_pending[assoc.client_ip]
 
 
 def handle_client(client_socket):
@@ -716,7 +823,17 @@ def handle_client(client_socket):
                 response = b'\x05\x00\x00\x01' + socket.inet_aton(bnd_ip)
             response += struct.pack('>H', PORT)
             client_socket.sendall(response)
-            udp_relay(udp_sock, client_socket.getpeername(), client_socket)
+
+            # Register the association and start its relay thread. Joining
+            # keeps this TCP connection alive until the client closes it;
+            # the relay thread then cleans up and exits on its own.
+            assoc = UdpAssociation(client_socket)
+            with udp_lock:
+                udp_pending.setdefault(assoc.client_ip, []).append(assoc)
+            relay_thread = threading.Thread(
+                target=udp_client_loop, args=(assoc,), daemon=True)
+            relay_thread.start()
+            relay_thread.join()
             return
 
         # --- Connect to the requested target --------------------------------
@@ -800,6 +917,9 @@ def main():
 
     # Keep the launcher's `status` command up to date with live stats
     threading.Thread(target=stats_writer, daemon=True).start()
+
+    # Route UDP ASSOCIATE datagrams to their per-client relay threads
+    threading.Thread(target=udp_dispatcher, daemon=True).start()
 
     # Accept loop: hand each incoming client to its own daemon thread
     while True:
