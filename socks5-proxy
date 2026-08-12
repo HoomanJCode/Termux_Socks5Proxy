@@ -116,6 +116,8 @@ save_config() {
     grep -v "^$key=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null || true
     echo "$key=$value" >> "$CONFIG_FILE.tmp"
     mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    # The config can hold an auth password — keep it private to this user
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
 # ----------------------------------------------------------------------------
@@ -285,7 +287,8 @@ ${GREEN}COMMANDS${NC}
     set port <1-65535>   Save the listening port
     set ip <IP>          Save the listening IP (IPv4 or IPv6 literal)
                          0.0.0.0 / :: = all interfaces
-    set auth <u> <pass>  Save a username/password (RFC 1929 auth)
+    set auth <u> [pass]  Save a username/password (RFC 1929 auth)
+                       (password omitted -> prompted hidden)
     unset auth           Disable authentication
     show config          Show the saved port, IP, and auth state
     help                 Show this help
@@ -406,6 +409,7 @@ import threading
 import sys
 import struct
 import hmac
+import time
 
 # Listening port: taken from the command line, defaulting to 1080
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
@@ -424,6 +428,11 @@ AUTH_REQUIRED = bool(AUTH_USER)
 
 # Shared UDP socket used for UDP ASSOCIATE relay (created in main())
 udp_sock = None
+
+# Serializes authentication attempts so a failed login throttles the next
+# one too (a fresh connection would otherwise be handled by a new thread
+# and brute force would go unhindered)
+auth_lock = threading.Lock()
 
 
 def tune_socket(sock):
@@ -576,31 +585,40 @@ def handle_client(client_socket):
             client_socket.sendall(b'\x05\x02')       # we require user/password
 
             # --- RFC 1929 username/password subnegotiation -------------------
-            auth = recv_exact(client_socket, 2)      # VER + ULEN
-            if len(auth) < 2 or auth[0] != 0x01:
-                client_socket.close()
-                return
-            ulen = auth[1]
-            uname = recv_exact(client_socket, ulen)
-            if len(uname) < ulen:
-                client_socket.close()
-                return
-            plen = recv_exact(client_socket, 1)
-            if len(plen) < 1:
-                client_socket.close()
-                return
-            passwd = recv_exact(client_socket, plen[0])
-            if len(passwd) < plen[0]:
-                client_socket.close()
-                return
-            # Constant-time comparison prevents timing side-channels
-            if hmac.compare_digest(uname, AUTH_USER.encode('utf-8')) \
-                    and hmac.compare_digest(passwd, AUTH_PASS.encode('utf-8')):
-                client_socket.sendall(b'\x01\x00')   # success
-            else:
-                client_socket.sendall(b'\x01\x01')   # failure
-                client_socket.close()
-                return
+            # The lock serializes attempts: on a failure we sleep while still
+            # holding it, so the next client's login is forced to wait.
+            auth_lock.acquire()
+            try:
+                auth = recv_exact(client_socket, 2)      # VER + ULEN
+                if len(auth) < 2 or auth[0] != 0x01:
+                    client_socket.close()
+                    return
+                ulen = auth[1]
+                uname = recv_exact(client_socket, ulen)
+                if len(uname) < ulen:
+                    client_socket.close()
+                    return
+                plen = recv_exact(client_socket, 1)
+                if len(plen) < 1:
+                    client_socket.close()
+                    return
+                passwd = recv_exact(client_socket, plen[0])
+                if len(passwd) < plen[0]:
+                    client_socket.close()
+                    return
+                # Constant-time comparison prevents timing side-channels
+                if hmac.compare_digest(uname, AUTH_USER.encode('utf-8')) \
+                        and hmac.compare_digest(passwd, AUTH_PASS.encode('utf-8')):
+                    client_socket.sendall(b'\x01\x00')   # success
+                else:
+                    client_socket.sendall(b'\x01\x01')   # failure
+                    # Hold the lock during the sleep so the NEXT client's
+                    # auth attempt is delayed too (global throttle)
+                    time.sleep(2)
+                    client_socket.close()
+                    return
+            finally:
+                auth_lock.release()
         else:
             # No authentication (the default)
             client_socket.sendall(b'\x05\x00')
@@ -902,17 +920,28 @@ set_ip() {
 
 # ----------------------------------------------------------------------------
 # set_auth — enable username/password authentication (RFC 1929)
-#   Args: $1 = username, $2 = password
+#   Args: $1 = username, $2 = password (optional — prompted hidden if omitted,
+#         so the password never appears in `ps` output or shell history)
 # ----------------------------------------------------------------------------
 set_auth() {
-    if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
-        echo -e "${RED}❌ Usage: socks5-proxy set auth <username> <password>${NC}"
+    local user="${1:-}" pass="${2:-}"
+    if [ -z "$user" ]; then
+        echo -e "${RED}❌ Usage: socks5-proxy set auth <username> [password]${NC}"
+        echo -e "${YELLOW}   If you omit the password you will be prompted for it.${NC}"
         exit 1
     fi
-    save_config "PROXY_USER" "$1"
-    save_config "PROXY_PASS" "$2"
-    echo -e "${GREEN}✅ Authentication enabled (user: $1).${NC}"
-    echo -e "${YELLOW}ℹ️  Credentials are stored in plaintext in $CONFIG_FILE.${NC}"
+    if [ -z "$pass" ]; then
+        read -s -p "Password: " pass
+        echo   # newline after the hidden input
+        if [ -z "$pass" ]; then
+            echo -e "${RED}❌ Password cannot be empty.${NC}"
+            exit 1
+        fi
+    fi
+    save_config "PROXY_USER" "$user"
+    save_config "PROXY_PASS" "$pass"
+    echo -e "${GREEN}✅ Authentication enabled (user: $user).${NC}"
+    echo -e "${YELLOW}ℹ️  Credentials are stored in plaintext in $CONFIG_FILE (permissions 600).${NC}"
     if is_running; then
         echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy stop && socks5-proxy).${NC}"
     fi
