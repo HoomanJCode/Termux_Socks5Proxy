@@ -35,22 +35,42 @@ connection details. Later runs start instantly with the saved settings.
 
 ## Installation
 
-1. Copy the script into Termux's bin directory and make it executable:
+From the repository directory, run the installer:
 
-   ```bash
-   cp socks5-proxy "$PREFIX/bin/socks5-proxy"
-   chmod +x "$PREFIX/bin/socks5-proxy"
-   ```
+```bash
+bash install.sh
+```
 
-   (If you cloned this repo, the file is already executable.)
+This copies `socks5-proxy` into `$PREFIX/bin`, makes it executable, and
+verifies the installed copy before reporting success. You can then run it
+from anywhere:
 
-2. Run it:
+```bash
+socks5-proxy
+```
 
-   ```bash
-   socks5-proxy
-   ```
+On first run, Python will be installed automatically if needed.
 
-   On first run, Python will be installed automatically if needed.
+### Installer options
+
+| Command | Description |
+|---------|-------------|
+| `bash install.sh` | Install or update `socks5-proxy` |
+| `bash install.sh --prefix /path` | Install into `/path/bin` instead of `$PREFIX` |
+| `bash install.sh --uninstall` | Remove the installed copy (settings are kept) |
+| `bash install.sh --help` | Show usage |
+
+For a full cleanup, also remove the settings directory:
+`rm -rf $PREFIX/etc/socks5-proxy`.
+
+### Manual alternative
+
+If you prefer not to use the installer:
+
+```bash
+cp socks5-proxy "$PREFIX/bin/socks5-proxy"
+chmod +x "$PREFIX/bin/socks5-proxy"
+```
 
 ## Usage
 
@@ -112,7 +132,7 @@ curl --socks5 <USER>:<PASS>@<PHONE_IP>:<PORT> https://api.ipify.org
 | Watch connections | `socks5-proxy logs` |
 | Change port | `socks5-proxy set port 1080` |
 | Change listening IP | `socks5-proxy set ip 0.0.0.0` |
-| Uninstall | `rm -rf $PREFIX/etc/socks5-proxy && rm $PREFIX/bin/socks5-proxy` |
+| Uninstall | `bash install.sh --uninstall && rm -rf $PREFIX/etc/socks5-proxy` |
 
 ## How it works
 
