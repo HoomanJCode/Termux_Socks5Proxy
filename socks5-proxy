@@ -67,6 +67,43 @@ get_stored_ip() {
 }
 
 # ----------------------------------------------------------------------------
+# get_stored_user — read the saved auth username (if any)
+#
+# Returns (via stdout): the stored username, or "" if none is saved yet.
+# Authentication is considered enabled when this is non-empty.
+# ----------------------------------------------------------------------------
+get_stored_user() {
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^PROXY_USER=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
+    else
+        echo ""   # no config file yet -> no stored user
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# get_stored_pass — read the saved auth password (if any)
+#
+# Returns (via stdout): the stored password, or "" if none is saved yet.
+# ----------------------------------------------------------------------------
+get_stored_pass() {
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^PROXY_PASS=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
+    else
+        echo ""   # no config file yet -> no stored password
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# remove_config — delete a key=value line from the config file
+#   Args: $1 = key to remove
+# ----------------------------------------------------------------------------
+remove_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    grep -v "^$1=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null || true
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+# ----------------------------------------------------------------------------
 # save_config — update a single key=value line in the config file, keeping
 #   any other settings intact
 #   Args: $1 = key, $2 = value
@@ -241,10 +278,15 @@ ${GREEN}COMMANDS${NC}
     status               Show whether the proxy is running + saved settings
     set port <1-65535>   Save the listening port
     set ip <IP>          Save the listening IP (0.0.0.0 = all interfaces)
-    show config          Show the saved port and IP
+    set auth <u> <pass>  Save a username/password (RFC 1929 auth)
+    unset auth           Disable authentication
+    show config          Show the saved port, IP, and auth state
     help                 Show this help
 
     <PORT>               Shortcut for start: use <PORT> and save it
+
+    Authentication is OFF by default and only applies after restart.
+    Credentials are stored in plaintext in the config file.
 
 ${GREEN}EXAMPLES${NC}
     socks5-proxy                  Start with the saved settings
@@ -338,19 +380,24 @@ cat > "$CONFIG_DIR/socks5_server.py" << 'EOL'
 #!/data/data/com.termux/files/usr/bin/python
 
 # -----------------------------------------------------------------------------
-# Minimal SOCKS5 (RFC 1928) proxy server.
+# Minimal SOCKS5 (RFC 1928) proxy server with optional username/password
+# authentication (RFC 1929).
 #
 # Protocol flow handled here:
 #   1. Client greets us:  VER(0x05) NMETHODS ...METHODS          (handshake)
-#   2. We reply with the chosen auth method (0x00 = no authentication)
-#   3. Client sends a request: VER CMD RSV ATYP ...ADDR... PORT
-#   4. We connect to the requested target and relay traffic both ways
+#   2. We pick an auth method: 0x00 (none) or 0x02 (user/password).
+#      Auth is enabled only when the SOCKS5_USER environment variable is set.
+#   3. If auth is required: the RFC 1929 VER ULEN UNAME PLEN PASSWD exchange
+#   4. Client sends a request: VER CMD RSV ATYP ...ADDR... PORT
+#   5. We connect to the requested target and relay traffic both ways
 # -----------------------------------------------------------------------------
 
+import os
 import socket
 import threading
 import sys
 import struct
+import hmac
 
 # Listening port: taken from the command line, defaulting to 1080
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
@@ -360,6 +407,12 @@ BIND_IP = sys.argv[2] if len(sys.argv) > 2 else '0.0.0.0'
 BUFFER_SIZE = 65536
 # Requested kernel socket buffer size (Linux doubles the requested value)
 SOCK_BUF_SIZE = 262144
+
+# Optional RFC 1929 username/password authentication. Disabled by default:
+# it only kicks in when SOCKS5_USER is set (the launcher provides it).
+AUTH_USER = os.environ.get('SOCKS5_USER', '')
+AUTH_PASS = os.environ.get('SOCKS5_PASS', '')
+AUTH_REQUIRED = bool(AUTH_USER)
 
 
 def tune_socket(sock):
@@ -403,12 +456,48 @@ def handle_client(client_socket):
             return
         nmethods = data[1]
         # Read the list of authentication methods the client offers
-        if len(recv_exact(client_socket, nmethods)) < nmethods:
+        methods = recv_exact(client_socket, nmethods)
+        if len(methods) < nmethods:
             client_socket.close()
             return
 
-        # Tell the client we picked "no authentication" (0x00)
-        client_socket.sendall(b'\x05\x00')
+        if AUTH_REQUIRED:
+            # Only username/password (0x02) is acceptable when auth is on
+            if 0x02 not in methods:
+                client_socket.sendall(b'\x05\xff')   # no acceptable methods
+                client_socket.close()
+                return
+            client_socket.sendall(b'\x05\x02')       # we require user/password
+
+            # --- RFC 1929 username/password subnegotiation -------------------
+            auth = recv_exact(client_socket, 2)      # VER + ULEN
+            if len(auth) < 2 or auth[0] != 0x01:
+                client_socket.close()
+                return
+            ulen = auth[1]
+            uname = recv_exact(client_socket, ulen)
+            if len(uname) < ulen:
+                client_socket.close()
+                return
+            plen = recv_exact(client_socket, 1)
+            if len(plen) < 1:
+                client_socket.close()
+                return
+            passwd = recv_exact(client_socket, plen[0])
+            if len(passwd) < plen[0]:
+                client_socket.close()
+                return
+            # Constant-time comparison prevents timing side-channels
+            if hmac.compare_digest(uname, AUTH_USER.encode('utf-8')) \
+                    and hmac.compare_digest(passwd, AUTH_PASS.encode('utf-8')):
+                client_socket.sendall(b'\x01\x00')   # success
+            else:
+                client_socket.sendall(b'\x01\x01')   # failure
+                client_socket.close()
+                return
+        else:
+            # No authentication (the default)
+            client_socket.sendall(b'\x05\x00')
 
         # --- SOCKS5 request ------------------------------------------------
         # Second message: VER(1) CMD(1) RSV(1) ATYP(1) ADDR(4..255) PORT(2)
@@ -523,15 +612,21 @@ EOL
 # 6) Launch the proxy in a new session so Ctrl+C on this script can never
 #    kill it: setsid detaches it from the terminal's process group (falling
 #    back to plain nohup if setsid is unavailable), and nohup ignores SIGHUP.
-#    The PID is saved so future runs can stop it cleanly.
-if command -v setsid >/dev/null 2>&1; then
-    setsid nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
-else
-    # setsid missing: the proxy stays in our process group, so Ctrl+C would
-    # kill it too — warn the user instead of silently claiming it's safe
-    echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
-    nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
-fi
+#    The PID is saved so future runs can stop it cleanly.    # Auth credentials are passed via the environment (not argv) so they never
+    # appear in `ps` output. An empty username means auth is disabled.
+    AUTH_USER=$(get_stored_user)
+    AUTH_PASS=$(get_stored_pass)
+
+    if command -v setsid >/dev/null 2>&1; then
+        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" \
+            setsid nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
+    else
+        # setsid missing: the proxy stays in our process group, so Ctrl+C would
+        # kill it too — warn the user instead of silently claiming it's safe
+        echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
+        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" \
+            nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
+    fi
 PROXY_PID=$!
 echo "$PROXY_PID" > "$PID_FILE"
 
@@ -563,13 +658,21 @@ echo -e "   Port: ${GREEN}${PORT}${NC}"
 echo -e "   Listening on: ${GREEN}${BIND_IP}:${PORT}${NC}"
 echo -e ""
 echo -e "${YELLOW}🧪 Test with curl:${NC}"
-echo -e "   ${GREEN}curl --socks5 ${ANDROID_IP}:${PORT} https://api.ipify.org${NC}"
+if [ -n "$AUTH_USER" ]; then
+    echo -e "   ${GREEN}curl --socks5 ${AUTH_USER}:${AUTH_PASS}@${ANDROID_IP}:${PORT} https://api.ipify.org${NC}"
+else
+    echo -e "   ${GREEN}curl --socks5 ${ANDROID_IP}:${PORT} https://api.ipify.org${NC}"
+fi
 echo -e ""
 echo -e "${YELLOW}📁 Config saved to: $CONFIG_FILE${NC}"
 echo -e "${YELLOW}📁 Python script at: $CONFIG_DIR/socks5_server.py${NC}"
 echo -e "${YELLOW}🔢 Port: $PORT${NC}"
 echo -e ""
-echo -e "${RED}⚠️  Security: No authentication! Use only on trusted networks.${NC}"
+if [ -n "$AUTH_USER" ]; then
+    echo -e "${GREEN}🔒 Authentication enabled (user: $AUTH_USER)${NC}"
+else
+    echo -e "${RED}⚠️  Security: No authentication! Use only on trusted networks.${NC}"
+fi
 echo -e "${GREEN}========================================${NC}"
 echo -e ""
 echo -e "${YELLOW}Commands:${NC}"
@@ -611,12 +714,18 @@ show_status() {
 
     local port=$(get_stored_port)
     local ip=$(get_stored_ip)
+    local user=$(get_stored_user)
 
     echo -e "${GREEN}===== SOCKS5 Proxy Status =====${NC}"
     echo -e "   Running: ${GREEN}$running${NC}"
     [ "$running" = "yes" ] && echo -e "   PID:     ${GREEN}$pid${NC}"
     echo -e "   Port:    ${GREEN}${port:-1080 (default)}${NC}"
     echo -e "   Listen:  ${GREEN}${ip:-0.0.0.0 (all interfaces)}${NC}"
+    if [ -n "$user" ]; then
+        echo -e "   Auth:    ${GREEN}on (user: $user)${NC}"
+    else
+        echo -e "   Auth:    ${YELLOW}off${NC}"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -652,12 +761,48 @@ set_ip() {
 }
 
 # ----------------------------------------------------------------------------
+# set_auth — enable username/password authentication (RFC 1929)
+#   Args: $1 = username, $2 = password
+# ----------------------------------------------------------------------------
+set_auth() {
+    if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+        echo -e "${RED}❌ Usage: socks5-proxy set auth <username> <password>${NC}"
+        exit 1
+    fi
+    save_config "PROXY_USER" "$1"
+    save_config "PROXY_PASS" "$2"
+    echo -e "${GREEN}✅ Authentication enabled (user: $1).${NC}"
+    echo -e "${YELLOW}ℹ️  Credentials are stored in plaintext in $CONFIG_FILE.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy stop && socks5-proxy).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# unset_auth — disable username/password authentication
+# ----------------------------------------------------------------------------
+unset_auth() {
+    remove_config "PROXY_USER"
+    remove_config "PROXY_PASS"
+    echo -e "${GREEN}✅ Authentication disabled.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy stop && socks5-proxy).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # show_config — print the saved configuration
 # ----------------------------------------------------------------------------
 show_config() {
+    local user=$(get_stored_user)
     echo -e "${YELLOW}📁 Saved configuration:${NC}"
     echo -e "   Port: ${GREEN}$(get_stored_port)${NC}"
     echo -e "   IP:   ${GREEN}$(get_stored_ip)${NC}"
+    if [ -n "$user" ]; then
+        echo -e "   Auth: ${GREEN}on (user: $user)${NC}"
+    else
+        echo -e "   Auth: ${YELLOW}off${NC}"
+    fi
 }
 
 # =============================================================================
@@ -680,11 +825,20 @@ case "$CMD" in
         case "${2:-}" in
             port) set_port "${3:-}" ;;
             ip)   set_ip "${3:-}" ;;
+            auth) set_auth "${3:-}" "${4:-}" ;;
             *)
-                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>}${NC}"
+                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>|auth <user> <pass>}${NC}"
                 exit 1
                 ;;
         esac
+        ;;
+    unset)
+        if [ "${2:-}" = "auth" ]; then
+            unset_auth
+        else
+            echo -e "${RED}❌ Usage: socks5-proxy unset auth${NC}"
+            exit 1
+        fi
         ;;
     show)
         if [ "${2:-}" = "config" ]; then

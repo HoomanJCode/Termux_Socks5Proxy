@@ -20,6 +20,7 @@ connection details. Later runs start instantly with the saved settings.
 - 🧵 Per-connection threading, partial-read safe, `sendall`-based relay
 - ⚡ Performance-tuned: 64 KiB relay buffers, `TCP_NODELAY`, and larger
   kernel socket buffers for low-latency, high-throughput transfers
+- 🔒 Optional username/password authentication (RFC 1929), off by default
 
 ## Requirements
 
@@ -68,7 +69,9 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 | `socks5-proxy status` | Show whether the proxy is running + saved settings |
 | `socks5-proxy set port 1080` | Save the listening port |
 | `socks5-proxy set ip 192.168.1.10` | Save the listening IP (`0.0.0.0` = all interfaces) |
-| `socks5-proxy show config` | Show the saved port and IP |
+| `socks5-proxy set auth myuser mypass` | Enable username/password auth (RFC 1929) |
+| `socks5-proxy unset auth` | Disable authentication |
+| `socks5-proxy show config` | Show the saved port, IP, and auth state |
 | `socks5-proxy help` | Show the help screen |
 
 ### Configure your other devices
@@ -85,7 +88,12 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 curl --socks5 <PHONE_IP>:<PORT> https://api.ipify.org
 ```
 
-If it prints your public IP, the proxy is working.
+If it prints your public IP, the proxy is working. With authentication
+enabled, include the credentials:
+
+```bash
+curl --socks5 <USER>:<PASS>@<PHONE_IP>:<PORT> https://api.ipify.org
+```
 
 ## Quick reference
 
@@ -129,11 +137,25 @@ your router doesn't block client-to-client traffic (AP isolation).
 
 ## Security
 
-> ⚠️ **No authentication!** The proxy is open to anyone who can reach it.
+> ⚠️ **No authentication by default!** Unless you enable it, the proxy is
+> open to anyone who can reach it.
 
-Only run it on networks you trust, and stop it when you don't need it
-(`socks5-proxy stop`). To limit exposure, bind to a specific interface
-instead of all interfaces: `socks5-proxy set ip 192.168.1.10`.
+Authentication is **off by default**. To require a username and password
+(RFC 1929):
+
+```bash
+socks5-proxy set auth myuser mypassword   # enable auth
+socks5-proxy unset auth                   # disable auth
+```
+
+Notes:
+
+- The change applies on the next `start` (restart the proxy if it's running).
+- Credentials are stored in plaintext in the config file
+  (`$PREFIX/etc/socks5-proxy/config`).
+- Only run the proxy on networks you trust, and stop it when you don't need
+  it (`socks5-proxy stop`). To limit exposure, bind to a specific interface
+  instead of all interfaces: `socks5-proxy set ip 192.168.1.10`.
 
 ## Contributing
 
