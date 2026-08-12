@@ -15,6 +15,12 @@
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/socks5-proxy"
 
+# Kill any proxy left over from an interrupted previous run so the fixed
+# test ports are never already in use. (The [s] trick prevents pkill from
+# matching this very command line.)
+pkill -f '[s]ocks5_server.py' 2>/dev/null
+sleep 1
+
 PASS=0
 FAIL=0
 
@@ -288,8 +294,6 @@ chk "unknown command rejected" \
 
 # ---------------------------------------------------------------------------
 echo "=== 8. end-to-end start/stop ==="
-pkill -f '[s]ocks5_server.py' 2>/dev/null
-sleep 1
 printf 'PROXY_PORT=19310\nPROXY_IP=127.0.0.1\n' > "$CONFIG_FILE"
 ( bash "$SCRIPT" start >/dev/null 2>&1 & )
 sleep 4

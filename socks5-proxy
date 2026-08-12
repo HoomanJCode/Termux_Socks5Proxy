@@ -321,8 +321,8 @@ ${GREEN}FIRST RUN${NC}
 ${GREEN}FILES${NC}
     $CONFIG_DIR/config      saved port (PROXY_PORT) and IP (PROXY_IP)
     $CONFIG_DIR/pid         PID of the running proxy
-    $CONFIG_DIR/proxy.log   proxy output (view with `logs`)
-    $CONFIG_DIR/stats       live stats for `status` (uptime, connections)
+    $CONFIG_DIR/proxy.log   proxy output (view with \`logs\`)
+    $CONFIG_DIR/stats       live stats for \`status\` (uptime, connections)
 
 ${RED}SECURITY${NC}
     The proxy has no authentication and is open to anyone who can reach it.
@@ -506,8 +506,10 @@ def udp_relay(udp_sock, client_addr, tcp_sock):
     knows which destination each reply came from.
 
     Runs on the client's own thread. A single shared UDP socket is used, so
-    this is simplest with one client at a time (the typical phone case);
-    datagrams from other clients are ignored.
+    this is simplest with one client at a time (the typical phone case).
+    NOTE: with two or more concurrent UDP clients, datagrams for the blocked
+    client can be picked up and dropped by another client's thread — packets
+    may be lost. Keep to one active UDP client for reliable delivery.
     """
     target = None
     dest = None
@@ -620,6 +622,10 @@ def handle_client(client_socket):
             # --- RFC 1929 username/password subnegotiation -------------------
             # The lock serializes attempts: on a failure we sleep while still
             # holding it, so the next client's login is forced to wait.
+            # The socket timeout bounds the whole exchange, so a client that
+            # stalls without sending credentials can't hold the global lock
+            # forever (which would lock out every other login).
+            client_socket.settimeout(10)
             auth_lock.acquire()
             try:
                 auth = recv_exact(client_socket, 2)      # VER + ULEN
@@ -642,6 +648,7 @@ def handle_client(client_socket):
                 # Constant-time comparison prevents timing side-channels
                 if hmac.compare_digest(uname, AUTH_USER.encode('utf-8')) \
                         and hmac.compare_digest(passwd, AUTH_PASS.encode('utf-8')):
+                    client_socket.settimeout(None)   # back to blocking relay
                     client_socket.sendall(b'\x01\x00')   # success
                 else:
                     client_socket.sendall(b'\x01\x01')   # failure
