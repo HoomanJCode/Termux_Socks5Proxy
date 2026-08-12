@@ -322,7 +322,8 @@ ${GREEN}FILES${NC}
     $CONFIG_DIR/config      saved port (PROXY_PORT) and IP (PROXY_IP)
     $CONFIG_DIR/pid         PID of the running proxy
     $CONFIG_DIR/proxy.log   proxy output (view with \`logs\`)
-    $CONFIG_DIR/stats       live stats for \`status\` (uptime, connections)
+    $CONFIG_DIR/stats       live stats for \`status\` (uptime, connections, bytes)
+    $CONFIG_DIR/conns       recent connections with bytes relayed (for \`status\`)
 
 ${RED}SECURITY${NC}
     The proxy has no authentication and is open to anyone who can reach it.
@@ -419,6 +420,7 @@ import struct
 import hmac
 import time
 import queue
+import collections
 
 # Listening port: taken from the command line, defaulting to 1080
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
@@ -445,24 +447,36 @@ auth_lock = threading.Lock()
 
 # Live stats for the launcher's `status` command. The launcher passes a
 # stats-file path via the SOCKS5_STATS environment variable; a background
-# thread refreshes the file every couple of seconds.
+# thread refreshes the file every couple of seconds. SOCKS5_CONNS points at
+# a second file holding the most recent completed connections.
 STATS_FILE = os.environ.get('SOCKS5_STATS', '')
+CONNS_FILE = os.environ.get('SOCKS5_CONNS', '')
 START_TIME = time.time()
 _stats_lock = threading.Lock()
 _active_conns = 0
 _total_conns = 0
+_bytes_up = 0      # cumulative bytes relayed client -> target
+_bytes_down = 0    # cumulative bytes relayed target -> client
+# Most recent completed connections (newest first) for the launcher's
+# `status` command: (start, peer, dest, up, down, duration)
+_recent_conns = collections.deque(maxlen=20)
 
 
 def stats_writer():
-    """Periodically persist live connection stats for the launcher."""
+    """Periodically persist live stats for the launcher's `status` command."""
     if not STATS_FILE:
         return
     while True:
         with _stats_lock:
             try:
                 with open(STATS_FILE, 'w') as f:
-                    f.write('START=%d\nACTIVE=%d\nTOTAL=%d\n' % (
-                        int(START_TIME), _active_conns, _total_conns))
+                    f.write('START=%d\nACTIVE=%d\nTOTAL=%d\nUP=%d\nDOWN=%d\n' % (
+                        int(START_TIME), _active_conns, _total_conns,
+                        _bytes_up, _bytes_down))
+                if CONNS_FILE:
+                    with open(CONNS_FILE, 'w') as f:
+                        for rec in _recent_conns:
+                            f.write('%d|%s|%s|%d|%d|%d\n' % rec)
             except OSError:
                 pass
         time.sleep(2)
@@ -528,6 +542,9 @@ class UdpAssociation:
         self.dest = None            # (addr, port) that self.target talks to
         self.reply_hdr = None       # ATYP + address bytes for reply headers
         self.dest_port = 0
+        self.bytes_up = 0           # payload bytes sent toward the target
+        self.bytes_down = 0         # reply bytes sent back to the client
+        self.started = time.time()
         self.alive = True
 
 
@@ -628,6 +645,7 @@ def _relay_datagram(assoc, data, src):
             assoc.reply_hdr = reply_hdr
             assoc.dest_port = port
         assoc.target.sendto(payload, assoc.dest)
+        assoc.bytes_up += len(payload)
     except (OSError, ValueError, IndexError):
         pass   # malformed datagram — drop it
 
@@ -654,12 +672,14 @@ def _drain_replies(assoc, block=0):
         hdr = b'\x00\x00\x00' + assoc.reply_hdr + struct.pack('>H', assoc.dest_port)
         try:
             udp_sock.sendto(hdr + resp, assoc.client_udp)
+            assoc.bytes_down += len(resp)
         except OSError:
             return
 
 
 def udp_client_loop(assoc):
     """Relay one client's UDP datagrams until its TCP association closes."""
+    global _bytes_up, _bytes_down, _recent_conns
     tcp = assoc.tcp_sock
     tcp.setblocking(False)
     try:
@@ -699,11 +719,25 @@ def udp_client_loop(assoc):
                 plist.remove(assoc)
                 if not plist:
                     del udp_pending[assoc.client_ip]
+        # Fold this association's byte counts into the totals and record it
+        # for `status` (only when it actually moved data).
+        if assoc.bytes_up or assoc.bytes_down:
+            with _stats_lock:
+                _bytes_up += assoc.bytes_up
+                _bytes_down += assoc.bytes_down
+                if assoc.dest:
+                    _recent_conns.appendleft((
+                        int(assoc.started),
+                        '%s:%d' % (assoc.client_ip, assoc.tcp_peer_port),
+                        '%s:%d' % assoc.dest,
+                        assoc.bytes_up, assoc.bytes_down,
+                        int(time.time() - assoc.started)))
 
 
 def handle_client(client_socket):
     """Handle a single SOCKS5 client connection on its own thread."""
-    global _active_conns
+    global _active_conns, _bytes_up, _bytes_down, _recent_conns
+    started = time.time()
     try:
         # --- SOCKS5 handshake (client greeting) -----------------------------
         # First message: VER(1) NMETHODS(1) METHODS(NMETHODS) — max 257 bytes
@@ -859,25 +893,61 @@ def handle_client(client_socket):
         client_socket.sendall(response)
 
         # --- Bidirectional traffic relay ------------------------------------
-        def forward(src, dst):
-            """Copy data from `src` to `dst` until one side closes."""
+        # Copy client -> target on a background thread, and target -> client
+        # on this thread (the main loop keeps the connection alive). Both
+        # directions count bytes into the same per-connection counters.
+        # `done` lets either direction wind the other down when it finishes,
+        # and the short recv timeouts make that prompt even when the peer on
+        # the other side never sends anything else.
+        try:
+            peer = '%s:%d' % client_socket.getpeername()[:2]
+        except OSError:
+            peer = '?'
+        counters = {'up': 0, 'down': 0}
+        done = threading.Event()
+        client_socket.settimeout(1)
+        target_socket.settimeout(1)
+
+        def forward(src, dst, direction):
+            """Copy data from `src` to `dst`, counting bytes in `direction`."""
             try:
                 while True:
-                    data = src.recv(BUFFER_SIZE)
+                    try:
+                        data = src.recv(BUFFER_SIZE)
+                    except socket.timeout:
+                        if done.is_set():
+                            break   # the other direction already ended
+                        continue
                     if not data:
                         break   # remote side closed the connection
                     dst.sendall(data)   # sendall: never silently truncates
+                    with _stats_lock:
+                        counters[direction] += len(data)
             except:
                 pass            # connection reset / timeout — stop copying
             finally:
+                done.set()      # this direction is finished
                 # Close both sockets to tear down the tunnel
                 src.close()
                 dst.close()
 
-        # Copy client -> target on a background thread, and target -> client
-        # on this thread (the main loop keeps the connection alive).
-        threading.Thread(target=forward, args=(client_socket, target_socket), daemon=True).start()
-        forward(target_socket, client_socket)
+        up_thread = threading.Thread(
+            target=forward, args=(client_socket, target_socket, 'up'),
+            daemon=True)
+        up_thread.start()
+        forward(target_socket, client_socket, 'down')
+        up_thread.join(timeout=5)   # let the last client->target bytes count
+
+        # Record this connection for the launcher's `status` command. Like the
+        # UDP side, only connections that actually moved data are listed.
+        if counters['up'] or counters['down']:
+            with _stats_lock:
+                _bytes_up += counters['up']
+                _bytes_down += counters['down']
+                _recent_conns.appendleft((
+                    int(started), peer, '%s:%d' % (addr, port),
+                    counters['up'], counters['down'],
+                    int(time.time() - started)))
 
     except Exception as e:
         pass   # any unexpected error: just drop this client
@@ -948,14 +1018,14 @@ EOL
     # stats are written for the `status` command. Credentials stay in env vars.
     # -u keeps the log output unbuffered so `socks5-proxy logs` sees it live
     if command -v setsid >/dev/null 2>&1; then
-        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" \
+        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" \
             setsid nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
             > "$CONFIG_DIR/proxy.log" 2>&1 &
     else
         # setsid missing: the proxy stays in our process group, so Ctrl+C would
         # kill it too — warn the user instead of silently claiming it's safe
         echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
-        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" \
+        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" \
             nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
             > "$CONFIG_DIR/proxy.log" 2>&1 &
     fi
@@ -1053,6 +1123,27 @@ format_uptime() {
 }
 
 # ----------------------------------------------------------------------------
+# format_bytes — print a byte count in human-readable form
+#   Args: $1 = number of bytes
+#   Returns (via stdout): e.g. "1.2 KiB" / "3.4 MiB" / "900 B"
+#   Pure bash integer math (n*10/div) so it needs no awk or python.
+# ----------------------------------------------------------------------------
+format_bytes() {
+    local n=${1:-0} unit="B"
+    if [ "$n" -ge 1073741824 ]; then
+        unit="GiB"; n=$(( (n * 10) / 1073741824 ))
+    elif [ "$n" -ge 1048576 ]; then
+        unit="MiB"; n=$(( (n * 10) / 1048576 ))
+    elif [ "$n" -ge 1024 ]; then
+        unit="KiB"; n=$(( (n * 10) / 1024 ))
+    else
+        echo "${n} B"
+        return
+    fi
+    echo "$((n / 10)).$((n % 10)) ${unit}"
+}
+
+# ----------------------------------------------------------------------------
 # show_status — print whether the proxy is running and the saved settings
 # ----------------------------------------------------------------------------
 show_status() {
@@ -1073,12 +1164,27 @@ show_status() {
     echo -e "   Listen:  ${GREEN}${ip:-0.0.0.0 (all interfaces)}${NC}"
     if [ "$running" = "yes" ] && [ -f "$CONFIG_DIR/stats" ]; then
         # Live stats written by the proxy every few seconds
-        local start_t active total
+        local start_t active total up down
         start_t=$(sed -n 's/^START=//p' "$CONFIG_DIR/stats" | head -1)
         active=$(sed -n 's/^ACTIVE=//p' "$CONFIG_DIR/stats" | head -1)
         total=$(sed -n 's/^TOTAL=//p' "$CONFIG_DIR/stats" | head -1)
+        up=$(sed -n 's/^UP=//p' "$CONFIG_DIR/stats" | head -1)
+        down=$(sed -n 's/^DOWN=//p' "$CONFIG_DIR/stats" | head -1)
         [ -n "$start_t" ] && echo -e "   Uptime:  ${GREEN}$(format_uptime "$start_t")${NC}"
         [ -n "$active" ] && echo -e "   Active:  ${GREEN}${active}${NC} connection(s), ${total:-0} total"
+        [ -n "$up" ] && echo -e "   Traffic: ${GREEN}$(format_bytes "$up")${NC} up / ${GREEN}$(format_bytes "$down")${NC} down"
+        # Most recent connections (newest first), with bytes relayed each way
+        if [ -s "$CONFIG_DIR/conns" ]; then
+            echo -e "   ${YELLOW}Recent connections (last ${YELLOW}$(wc -l < "$CONFIG_DIR/conns")${YELLOW}):${NC}"
+            local i=0
+            while IFS='|' read -r st peer dest upc downc secs; do
+                [ "$i" -ge 5 ] && break
+                i=$((i + 1))
+                echo -e "     ${BLUE}$peer${NC} -> ${BLUE}$dest${NC}  "\
+                    "$(format_bytes "$upc") up / $(format_bytes "$downc") down  "\
+                    "(${YELLOW}${secs}s${NC})"
+            done < "$CONFIG_DIR/conns"
+        fi
     fi
     if [ -n "$user" ]; then
         echo -e "   Auth:    ${GREEN}on (user: $user)${NC}"

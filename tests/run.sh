@@ -291,6 +291,90 @@ PYEOF
 [ $? -eq 0 ] && ok "concurrent UDP suite passed" || bad "concurrent UDP suite failed"
 
 # ---------------------------------------------------------------------------
+echo "=== 4c. bytes relayed tracking ==="
+SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+# TCP echo sink
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(5)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def loop():
+    while True:
+        try: c, _ = sink.accept()
+        except OSError: return
+        threading.Thread(target=echo, args=(c,), daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
+
+stats = os.path.join(tmp, 'stats-bytes')
+conns = os.path.join(tmp, 'conns-bytes')
+env = dict(os.environ, SOCKS5_STATS=stats, SOCKS5_CONNS=conns)
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      '19350', '127.0.0.1'], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+time.sleep(1)
+chk("bytes: proxy starts", p.poll() is None)
+
+# Relay a known payload through CONNECT (echo sink doubles it back)
+s = socket.create_connection(('127.0.0.1', 19350), timeout=5)
+s.sendall(b'\x05\x01\x00'); assert s.recv(2) == b'\x05\x00'
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+payload = b'x' * 50000
+s.sendall(payload)
+got = b''
+while len(got) < len(payload):
+    got += s.recv(65536)
+peer = '127.0.0.1:%d' % s.getsockname()[1]
+s.close()
+
+# The stats writer flushes every 2s — wait until it has actually persisted
+# the counted bytes (a flush with 0s appears first, before the connection's
+# byte counts are folded into the totals, so loop until the numbers land).
+ready = False
+for _ in range(20):
+    time.sleep(0.5)
+    try:
+        st = open(stats).read()
+        up = int([l.split('=', 1)[1] for l in st.splitlines() if l.startswith('UP=')][0])
+        down = int([l.split('=', 1)[1] for l in st.splitlines() if l.startswith('DOWN=')][0])
+        if up >= len(payload) and down >= len(payload):
+            ready = True
+            break
+    except (OSError, IndexError, ValueError):
+        pass
+chk("bytes: stats file flushed", ready)
+chk("bytes: UP counts relayed bytes", up == len(payload))
+chk("bytes: DOWN counts relayed bytes", down == len(payload))
+
+cn = open(conns).read()
+lines = [l for l in cn.strip().splitlines() if l]
+chk("bytes: conns file has one connection", len(lines) == 1)
+start, peer2, dest, upc, downc, secs = lines[0].split('|')
+chk("bytes: conns records up bytes", int(upc) == len(payload))
+chk("bytes: conns records down bytes", int(downc) == len(payload))
+chk("bytes: conns records destination", dest == '127.0.0.1:%d' % tport)
+chk("bytes: conns records peer", peer2 == peer)
+
+p.terminate(); p.wait(); sink.close()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "bytes tracking suite passed" || bad "bytes tracking suite failed"
+
+# ---------------------------------------------------------------------------
 echo "=== 5. IPv6 listener (skipped if no IPv6 loopback) ==="
 SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
 import os, socket, struct, subprocess, sys, time
@@ -414,12 +498,51 @@ chk "e2e: status shows running" \
     'bash "$SCRIPT" status | strip_colors | grep -q "Running: yes"'
 chk "e2e: listens on saved port" \
     'python3 -c "import socket; s=socket.create_connection((\"127.0.0.1\",19310),timeout=3); s.close()"'
+# Relay real data through the running proxy so the conns file gets an entry
+python3 - <<'PYEOF'
+import socket, struct, subprocess, threading, time
+# local echo sink
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(5)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def loop():
+    while True:
+        try: c, _ = sink.accept()
+        except OSError: return
+        threading.Thread(target=echo, args=(c,), daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
+# SOCKS5 CONNECT through the proxy
+s = socket.create_connection(('127.0.0.1', 19310), timeout=5)
+s.sendall(b'\x05\x01\x00'); assert s.recv(2) == b'\x05\x00'
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+s.sendall(b'e2e-bytes')
+assert s.recv(9) == b'e2e-bytes'
+s.close(); sink.close()
+time.sleep(3)   # let the stats writer flush the conns file
+PYEOF
+chk "e2e: conns file has an entry" \
+    '[ -s "$CONFIG_DIR/conns" ]'
 chk "e2e: proxy.log written" \
     '[ -f "$CONFIG_DIR/proxy.log" ] && grep -q "SOCKS5 proxy running" "$CONFIG_DIR/proxy.log"'
 chk "e2e: stats file written" \
     '[ -f "$CONFIG_DIR/stats" ] && grep -q "^START=" "$CONFIG_DIR/stats"'
 chk "e2e: status shows uptime" \
     'bash "$SCRIPT" status | strip_colors | grep -q "Uptime:"'
+chk "e2e: status shows traffic bytes" \
+    'bash "$SCRIPT" status | strip_colors | grep -q "Traffic:"'
+chk "e2e: status renders formatted byte count" \
+    'bash "$SCRIPT" status | strip_colors | grep -qE "Traffic: [0-9]+(\\.[0-9])? [A-Z]?i?B up"'
+chk "e2e: status shows recent connections" \
+    'bash "$SCRIPT" status | strip_colors | grep -q "Recent connections"'
+chk "e2e: conns file written" \
+    '[ -f "$CONFIG_DIR/conns" ]'
 bash "$SCRIPT" stop >/dev/null 2>&1
 sleep 1
 chk "e2e: status shows stopped" \
