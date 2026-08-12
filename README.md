@@ -3,14 +3,16 @@
 Turn your Android phone (running [Termux](https://termux.com)) into a SOCKS5
 proxy server that any device on your local network can use.
 
-The script asks which port to listen on (it remembers the last one used),
-detects your phone's LAN IP, generates a small Python SOCKS5 server, and runs
-it in the background — printing ready-to-use connection details when done.
+On the first run you choose a port; the script saves it together with the
+listening IP, detects your phone's LAN address, generates a small Python
+SOCKS5 server, and runs it in the background — printing ready-to-use
+connection details. Later runs start instantly with the saved settings.
 
 ## Features
 
-- 📌 Remembers the last used port (stored in a config file)
+- 📌 Remembers the port and listening IP (stored in a config file)
 - 📶 Auto-detects your Wi-Fi/LAN IP address
+- 🎛️ Full CLI: `start`, `stop`, `status`, `set port`, `set ip`, `show config`
 - 🐍 Self-contained Python SOCKS5 server (RFC 1928), generated on first run
 - 🔄 Handles IPv4, domain names, and IPv6 targets
 - 🛡️ Restarts cleanly — a PID file tracks the running proxy, and a previous
@@ -54,6 +56,8 @@ socks5-proxy
 
 ### CLI commands
 
+Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
+
 | Command | Description |
 |---------|-------------|
 | `socks5-proxy` | Start the proxy (uses the saved port & IP) |
@@ -81,13 +85,12 @@ curl --socks5 <PHONE_IP>:<PORT> https://api.ipify.org
 
 If it prints your public IP, the proxy is working.
 
-## Commands
+## Quick reference
 
 | Action | Command |
 |--------|---------|
 | Start | `socks5-proxy` |
 | Stop | `socks5-proxy stop` |
-| Status | `socks5-proxy status` |
 | Change port | `socks5-proxy set port 1080` |
 | Change listening IP | `socks5-proxy set ip 0.0.0.0` |
 | Uninstall | `rm -rf $PREFIX/etc/socks5-proxy && rm $PREFIX/bin/socks5-proxy` |
@@ -100,8 +103,9 @@ If it prints your public IP, the proxy is working.
 | `$PREFIX/etc/socks5-proxy/socks5_server.py` | The generated Python SOCKS5 server |
 | `$PREFIX/etc/socks5-proxy/pid` | PID of the currently running proxy |
 
-The proxy listens on `0.0.0.0:<port>` and relays TCP traffic in both
-directions using one thread per connection.
+The proxy listens on the configured IP (default `0.0.0.0` — all interfaces)
+at the chosen port, and relays TCP traffic in both directions using one
+thread per connection.
 
 ## Troubleshooting
 
@@ -111,10 +115,10 @@ address. If it fails, run `ip -4 addr` yourself and use that IP manually.
 
 **Proxy fails to start**
 The port may already be in use, or Python didn't install. Run it in the
-foreground to see the error:
+foreground to see the error (the IP argument is optional):
 
 ```bash
-python "$PREFIX/etc/socks5-proxy/socks5_server.py" 1080
+python "$PREFIX/etc/socks5-proxy/socks5_server.py" 1080 0.0.0.0
 ```
 
 **Nothing can connect**
@@ -126,7 +130,8 @@ your router doesn't block client-to-client traffic (AP isolation).
 > ⚠️ **No authentication!** The proxy is open to anyone who can reach it.
 
 Only run it on networks you trust, and stop it when you don't need it
-(`kill $(cat $PREFIX/etc/socks5-proxy/pid)`).
+(`socks5-proxy stop`). To limit exposure, bind to a specific interface
+instead of all interfaces: `socks5-proxy set ip 192.168.1.10`.
 
 ## Contributing
 
