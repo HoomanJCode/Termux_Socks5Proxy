@@ -164,9 +164,11 @@ bash tests/run.sh
 ```
 
 It checks bash syntax, that the embedded Python compiles, the config/IP/port
-helper functions, the SOCKS5 protocol (CONNECT, UDP ASSOCIATE, IPv6, auth and
-throttling), the CLI, and a full start/stop cycle. It uses a temporary prefix,
-so it never touches your real configuration.
+helper functions, the SOCKS5 protocol (CONNECT with IPv4 and domain names,
+UDP ASSOCIATE, IPv6, auth and throttling, FRAG handling, unreachable targets,
+concurrent connections, large payloads), byte accounting, the CLI, and a full
+start/stop/restart cycle. It uses a temporary prefix, so it never touches
+your real configuration.
 
 ## Troubleshooting
 
