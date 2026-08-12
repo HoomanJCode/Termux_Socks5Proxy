@@ -69,13 +69,12 @@ is_valid_port() {
 }
 
 # ----------------------------------------------------------------------------
-# get_port — interactively ask the user for a listening port
+# get_port — choose the listening port
 #
-# Behavior:
-#   * If a port was saved previously, offer it as the default (Enter = reuse).
-#   * Otherwise fall back to port 1080 (the conventional SOCKS port) when the
-#     user just presses Enter.
-#   * The chosen port is saved to the config file for the next run.
+# Priority:
+#   1. A valid port passed as the first argument (e.g. `socks5-proxy 9999`)
+#   2. The port saved in the config file (used automatically, no prompt)
+#   3. Interactive prompt on first run (default 1080)
 # ----------------------------------------------------------------------------
 get_port() {
     # The port saved by the previous run, if any
@@ -88,28 +87,40 @@ get_port() {
     echo -e "${GREEN}========================================${NC}"
     echo -e ""
 
-    if [ -n "$stored_port" ]; then
-        # A port is already saved -> offer it as the default choice
-        echo -e "${YELLOW}📌 Last used port: ${GREEN}$stored_port${NC}"
-        echo -e "${YELLOW}Press Enter to use same port, or type a new port:${NC}"
-        prompt="Port [$stored_port]: "
-    else
-        # First run -> ask for a port from scratch
-        echo -e "${YELLOW}📝 Enter the port number you want to use:${NC}"
-        echo -e "${BLUE}   (e.g., 1080 is the default SOCKS port)${NC}"
-        prompt="Port [1080]: "
+    # 1) A valid port on the command line wins and is saved, so the port can
+    #    be changed without touching the config file
+    if [ -n "${1:-}" ]; then
+        if is_valid_port "$1"; then
+            PORT="$1"
+            echo -e "${YELLOW}Using port from command line: ${GREEN}$PORT${NC}"
+            save_port "$PORT"
+            return
+        fi
+        echo -e "${YELLOW}⚠️  Ignoring invalid port argument: '$1'${NC}"
     fi
+
+    # 2) A saved port is reused automatically — no prompt on later runs
+    if [ -n "$stored_port" ]; then
+        if is_valid_port "$stored_port"; then
+            PORT="$stored_port"
+            echo -e "${YELLOW}📌 Using saved port: ${GREEN}$PORT${NC}"
+            return
+        fi
+        # Corrupt saved port -> fall through and ask for a new one
+        echo -e "${YELLOW}⚠️  Saved port '$stored_port' is invalid — please enter a new one:${NC}"
+    fi
+
+    # 3) First run -> ask for a port from scratch
+    echo -e "${YELLOW}📝 Enter the port number you want to use:${NC}"
+    echo -e "${BLUE}   (e.g., 1080 is the default SOCKS port)${NC}"
+    prompt="Port [1080]: "
 
     # Keep asking until a valid port is given (Enter = use the default)
     while true; do
         read -p "$prompt" PORT
         if [ -z "$PORT" ]; then
-            # Empty input -> default: the stored port, or 1080 on first run.
-            # If the stored port is corrupt, fall back to the safe default.
-            PORT="${stored_port:-1080}"
-            if ! is_valid_port "$PORT"; then
-                PORT=1080
-            fi
+            # Empty input -> default to the standard SOCKS port
+            PORT=1080
             echo -e "${YELLOW}Using port: $PORT${NC}"
         fi
         if is_valid_port "$PORT"; then
@@ -165,8 +176,9 @@ get_android_ip() {
 # Main script execution starts here
 # =============================================================================
 
-# 1) Ask the user which port to use
-get_port
+# 1) Choose the port (saved port is used automatically; the first argument
+#    can override it, e.g. `socks5-proxy 9999`)
+get_port "$1"
 
 echo -e ""
 echo -e "${YELLOW}⏳ Starting SOCKS5 proxy on port $PORT...${NC}"

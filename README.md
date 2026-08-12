@@ -43,19 +43,17 @@ it in the background — printing ready-to-use connection details when done.
 
 ## Usage
 
-Run the script, choose a port (Enter accepts the default: the last used port,
-or `1080`):
+Run the script:
 
 ```bash
-$ socks5-proxy
-========================================
-     SOCKS5 Proxy Server
-========================================
-Port [1080]:
-Using port: 1080
-...
-✅ SOCKS5 PROXY IS RUNNING!
+socks5-proxy
 ```
+
+- **First run:** you'll be asked for a port (Enter uses the default `1080`).
+  The port is saved, so later runs start immediately with no prompt.
+- **Switch ports:** pass the port as an argument, e.g. `socks5-proxy 9999` —
+  or delete the config with `rm $PREFIX/etc/socks5-proxy/config` to be asked
+  again on the next run.
 
 ### Configure your other devices
 
@@ -80,7 +78,7 @@ If it prints your public IP, the proxy is working.
 | Start | `socks5-proxy` |
 | Stop | `kill $(cat $PREFIX/etc/socks5-proxy/pid)` |
 | Check status | `ps aux \| grep socks5` |
-| Change port | run the script and type a new port (or `rm $PREFIX/etc/socks5-proxy/config` to forget the stored one) |
+| Change port | `socks5-proxy <PORT>` (or `rm $PREFIX/etc/socks5-proxy/config` to be prompted again) |
 | Uninstall | `rm -rf $PREFIX/etc/socks5-proxy && rm $PREFIX/bin/socks5-proxy` |
 
 ## How it works
