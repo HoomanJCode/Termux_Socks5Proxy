@@ -1,0 +1,365 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# =============================================================================
+# socks5-proxy — SOCKS5 proxy launcher for Termux (Android)
+#
+# What this script does:
+#   1. Asks the user which port to listen on (remembers the last one used)
+#   2. Detects the device's LAN IP address so other devices can reach it
+#   3. Generates a small Python SOCKS5 server and runs it in the background
+#   4. Prints connection details and useful commands for the user
+#
+# Files managed by this script:
+#   $PREFIX/etc/socks5-proxy/config            -> remembers the last port used
+#   $PREFIX/etc/socks5-proxy/socks5_server.py  -> the generated Python server
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# ANSI escape codes for colored terminal output
+# ----------------------------------------------------------------------------
+GREEN='\033[0;32m'   # green  — success messages / values
+YELLOW='\033[1;33m'  # yellow — informational text
+RED='\033[0;31m'     # red    — errors
+BLUE='\033[0;34m'    # blue   — hints / examples
+NC='\033[0m'         # no color — resets formatting back to default
+
+# ----------------------------------------------------------------------------
+# Configuration paths
+# $PREFIX is Termux's install root (e.g. /data/data/com.termux/files/usr),
+# so the config lives system-wide under $PREFIX/etc, not in the home dir.
+# ----------------------------------------------------------------------------
+CONFIG_DIR="$PREFIX/etc/socks5-proxy"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Ensure the config directory exists before writing into it
+mkdir -p "$CONFIG_DIR"
+
+# ----------------------------------------------------------------------------
+# get_stored_port — read the port saved by a previous run (if any)
+#
+# Returns (via stdout): the stored port number, or "" if none is saved yet.
+# ----------------------------------------------------------------------------
+get_stored_port() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # Load the config file so its PROXY_PORT variable becomes available
+        source "$CONFIG_FILE"
+        echo "$PROXY_PORT"
+    else
+        echo ""   # no config file yet -> no stored port
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# save_port — persist the chosen port so it can be reused next time
+#   Args: $1 = the port number to remember
+# ----------------------------------------------------------------------------
+save_port() {
+    echo "PROXY_PORT=$1" > "$CONFIG_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# get_port — interactively ask the user for a listening port
+#
+# Behavior:
+#   * If a port was saved previously, offer it as the default (Enter = reuse).
+#   * Otherwise fall back to port 1080 (the conventional SOCKS port) when the
+#     user just presses Enter.
+#   * The chosen port is saved to the config file for the next run.
+# ----------------------------------------------------------------------------
+get_port() {
+    # The port saved by the previous run, if any
+    local stored_port=$(get_stored_port)
+
+    # Banner header
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}     SOCKS5 Proxy Server              ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e ""
+
+    if [ -n "$stored_port" ]; then
+        # A port is already saved -> offer it as the default choice
+        echo -e "${YELLOW}📌 Last used port: ${GREEN}$stored_port${NC}"
+        echo -e "${YELLOW}Press Enter to use same port, or type a new port:${NC}"
+        read -p "Port [$stored_port]: " USER_PORT
+        if [ -z "$USER_PORT" ]; then
+            # User pressed Enter -> keep the stored port
+            PORT=$stored_port
+        else
+            # User typed a new port -> use and save it
+            PORT=$USER_PORT
+            save_port $PORT
+        fi
+    else
+        # First run -> ask for a port from scratch
+        echo -e "${YELLOW}📝 Enter the port number you want to use:${NC}"
+        echo -e "${BLUE}   (e.g., 1080 is the default SOCKS port)${NC}"
+        read -p "Port: " PORT
+        if [ -z "$PORT" ]; then
+            # User pressed Enter -> fall back to the standard SOCKS port
+            PORT=1080
+            echo -e "${YELLOW}Using default port: $PORT${NC}"
+        fi
+        save_port $PORT
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# get_android_ip — detect the device's IP address on the local network
+#
+# Tries several strategies in order of preference:
+#   1. The wlan0 interface (most common Wi-Fi interface name)
+#   2. The wlan1 interface (secondary Wi-Fi / hotspot)
+#   3. Any 192.168.x.x address on any interface
+#   4. Any 10.x.x.x address on any interface
+#   5. The legacy `ifconfig` output as a last resort
+#
+# Returns (via stdout): the detected IP address.
+# Exits the script with an error if nothing can be detected.
+# ----------------------------------------------------------------------------
+get_android_ip() {
+    # Strategy 1: explicit wlan0 interface
+    IP=$(ip -4 addr show wlan0 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+    # Strategy 2: explicit wlan1 interface
+    if [ -z "$IP" ]; then
+        IP=$(ip -4 addr show wlan1 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+    fi
+    # Strategy 3: any 192.168.x.x address on any interface
+    if [ -z "$IP" ]; then
+        IP=$(ip -4 addr 2>/dev/null | grep -oP 'inet \K192\.168\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    # Strategy 4: any 10.x.x.x address on any interface
+    if [ -z "$IP" ]; then
+        IP=$(ip -4 addr 2>/dev/null | grep -oP 'inet \K10\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    # Strategy 5: legacy ifconfig output (older Android/Termux setups)
+    if [ -z "$IP" ]; then
+        IP=$(ifconfig 2>/dev/null | grep -oP 'inet addr:\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -v '127.0.0.1' | head -1)
+    fi
+    # If every strategy failed, we cannot give the user a usable address
+    if [ -z "$IP" ]; then
+        echo -e "${RED}❌ Could not detect your Android IP!${NC}"
+        echo -e "${YELLOW}Run: ${GREEN}ip -4 addr${NC}${YELLOW} and find your IP manually${NC}"
+        exit 1
+    fi
+    echo "$IP"
+}
+
+# =============================================================================
+# Main script execution starts here
+# =============================================================================
+
+# 1) Ask the user which port to use
+get_port
+
+echo -e ""
+echo -e "${YELLOW}⏳ Starting SOCKS5 proxy on port $PORT...${NC}"
+
+# 2) Kill any leftover proxy process that may still be running from a
+#    previous session (matching either the server script name or the port).
+pkill -f "python.*socks5_server" 2>/dev/null || true
+pkill -f "python.*$PORT" 2>/dev/null || true
+
+# 3) Make sure Python is installed; install it via Termux's package manager
+#    if it is missing.
+if ! command -v python &> /dev/null; then
+    echo -e "${YELLOW}📦 Installing Python...${NC}"
+    pkg install python -y
+fi
+
+# 4) Generate the Python SOCKS5 server.
+#    NOTE: the heredoc delimiter is quoted ('EOL'), so no variable expansion
+#    happens — the script is written to disk exactly as shown below.
+cat > "$CONFIG_DIR/socks5_server.py" << 'EOL'
+#!/data/data/com.termux/files/usr/bin/python
+
+# -----------------------------------------------------------------------------
+# Minimal SOCKS5 (RFC 1928) proxy server.
+#
+# Protocol flow handled here:
+#   1. Client greets us:  VER(0x05) NMETHODS ...METHODS          (handshake)
+#   2. We reply with the chosen auth method (0x00 = no authentication)
+#   3. Client sends a request: VER CMD RSV ATYP ...ADDR... PORT
+#   4. We connect to the requested target and relay traffic both ways
+# -----------------------------------------------------------------------------
+
+import socket
+import threading
+import sys
+import struct
+
+# Listening port: taken from the command line, defaulting to 1080
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
+# Read/write chunk size for relaying traffic
+BUFFER_SIZE = 4096
+
+
+def handle_client(client_socket):
+    """Handle a single SOCKS5 client connection on its own thread."""
+    try:
+        # --- SOCKS5 handshake (client greeting) -----------------------------
+        # First message: VER(1) NMETHODS(1) METHODS(NMETHODS) — max 257 bytes
+        data = client_socket.recv(262)
+        if not data or len(data) < 3:
+            client_socket.close()
+            return
+
+        # Reject anything that is not SOCKS version 5
+        if data[0] != 0x05:
+            client_socket.close()
+            return
+
+        # Tell the client we picked "no authentication" (0x00)
+        client_socket.send(b'\x05\x00')
+
+        # --- SOCKS5 request ------------------------------------------------
+        # Second message: VER(1) CMD(1) RSV(1) ATYP(1) ADDR(4..255) PORT(2)
+        request = client_socket.recv(262)
+        if not request or len(request) < 10:
+            client_socket.close()
+            return
+
+        # Parse the fixed header fields
+        ver = request[0]    # SOCKS version (should be 0x05)
+        cmd = request[1]    # command: CONNECT / BIND / UDP ASSOCIATE
+        atyp = request[3]   # address type: IPv4 / domain name / IPv6
+
+        # Parse the destination address + port according to ATYP
+        if atyp == 0x01:    # IPv4 (4 bytes)
+            addr = socket.inet_ntoa(request[4:8])
+            port = struct.unpack('>H', request[8:10])[0]
+            offset = 10
+        elif atyp == 0x03:  # Domain name (1 length byte + name)
+            domain_len = request[4]
+            addr = request[5:5+domain_len].decode('utf-8')
+            port = struct.unpack('>H', request[5+domain_len:7+domain_len])[0]
+            offset = 7 + domain_len
+        elif atyp == 0x04:  # IPv6 (16 bytes)
+            addr = socket.inet_ntop(socket.AF_INET6, request[4:20])
+            port = struct.unpack('>H', request[20:22])[0]
+            offset = 22
+        else:
+            # Unknown address type -> drop the connection
+            client_socket.close()
+            return
+
+        # --- Connect to the requested target --------------------------------
+        try:
+            target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            target_socket.settimeout(30)          # don't hang forever
+            target_socket.connect((addr, port))   # establish the connection
+        except Exception as e:
+            # Send a failure reply (REP 0x01 = general failure) and give up
+            client_socket.send(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            client_socket.close()
+            return
+
+        # --- Success reply (REP 0x00 = succeeded) ---------------------------
+        # BND.ADDR/BND.PORT are unused for CONNECT, so zeros are acceptable
+        bind_addr = '0.0.0.0'
+        bind_port = 0
+        response = b'\x05\x00\x00\x01'
+        response += socket.inet_aton(bind_addr)
+        response += struct.pack('>H', bind_port)
+        client_socket.send(response)
+
+        # --- Bidirectional traffic relay ------------------------------------
+        def forward(src, dst):
+            """Copy data from `src` to `dst` until one side closes."""
+            try:
+                while True:
+                    data = src.recv(BUFFER_SIZE)
+                    if not data:
+                        break   # remote side closed the connection
+                    dst.send(data)
+            except:
+                pass            # connection reset / timeout — stop copying
+            finally:
+                # Close both sockets to tear down the tunnel
+                src.close()
+                dst.close()
+
+        # Copy client -> target on a background thread, and target -> client
+        # on this thread (the main loop keeps the connection alive).
+        threading.Thread(target=forward, args=(client_socket, target_socket), daemon=True).start()
+        forward(target_socket, client_socket)
+
+    except Exception as e:
+        pass   # any unexpected error: just drop this client
+    finally:
+        client_socket.close()
+
+
+def main():
+    """Create the listening socket and serve clients forever."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Allow immediate rebinding after the proxy is killed/restarted
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Listen on all interfaces so other devices on the network can connect
+    server.bind(('0.0.0.0', PORT))
+    server.listen(50)
+
+    print(f"SOCKS5 proxy running on 0.0.0.0:{PORT}")
+    print("Ready for connections...")
+
+    # Accept loop: hand each incoming client to its own daemon thread
+    while True:
+        client, addr = server.accept()
+        print(f"Connection from {addr[0]}:{addr[1]}")
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
+EOL
+
+# 5) Launch the proxy in the background, detached from this terminal
+#    (nohup keeps it alive even if this script exits).
+nohup python "$CONFIG_DIR/socks5_server.py" $PORT > /dev/null 2>&1 &
+PROXY_PID=$!
+
+# 6) Give the server a moment to start, then verify it is still alive
+sleep 2
+
+if ps -p $PROXY_PID > /dev/null 2>&1; then
+    echo -e "${GREEN}✅ SOCKS5 proxy started!${NC}"
+else
+    # The process died — show the user how to run it manually to see the error
+    echo -e "${RED}❌ Failed to start proxy${NC}"
+    echo -e "${YELLOW}Try running manually:${NC}"
+    echo -e "   ${GREEN}python $CONFIG_DIR/socks5_server.py $PORT${NC}"
+    exit 1
+fi
+
+# 7) Detect the device IP so the user knows what address to connect to
+ANDROID_IP=$(get_android_ip)
+
+# 8) Print the summary: connection details, test command, and useful commands
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}✅ SOCKS5 PROXY IS RUNNING!${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo -e ""
+echo -e "${YELLOW}📱 On your PC, configure:${NC}"
+echo -e "   Type: ${GREEN}SOCKS5${NC}"
+echo -e "   Host: ${GREEN}${ANDROID_IP}${NC}"
+echo -e "   Port: ${GREEN}${PORT}${NC}"
+echo -e ""
+echo -e "${YELLOW}🧪 Test with curl:${NC}"
+echo -e "   ${GREEN}curl --socks5 ${ANDROID_IP}:${PORT} https://api.ipify.org${NC}"
+echo -e ""
+echo -e "${YELLOW}📁 Config saved to: $CONFIG_FILE${NC}"
+echo -e "${YELLOW}📁 Python script at: $CONFIG_DIR/socks5_server.py${NC}"
+echo -e "${YELLOW}🔢 Port: $PORT${NC}"
+echo -e ""
+echo -e "${RED}⚠️  Security: No authentication! Use only on trusted networks.${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo -e ""
+echo -e "${YELLOW}Commands:${NC}"
+echo -e "   Stop proxy: ${GREEN}pkill -f socks5_server.py${NC}"
+echo -e "   Check status: ${GREEN}ps aux | grep socks5${NC}"
+echo -e "   Change port: ${GREEN}rm $CONFIG_FILE && socks5-proxy${NC}"
+echo -e "   Uninstall: ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-proxy${NC}"
+echo -e ""
+echo -e "${YELLOW}Press Ctrl+C to exit (proxy stays running)${NC}"
+
+# 9) Keep the script alive so the user can read the output;
+#    `wait` blocks until the background proxy is killed.
+wait
