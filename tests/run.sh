@@ -48,8 +48,9 @@ export PREFIX="$TMP/prefix"
 export CONFIG_DIR="$PREFIX/etc/socks5-proxy"
 export CONFIG_FILE="$CONFIG_DIR/config"
 mkdir -p "$CONFIG_DIR"
-# Source only the function definitions (everything before the CLI section)
-sed -n '1,/^# Command-line interface$/p' "$SCRIPT" | sed '$d' > "$TMP/funcs.sh"
+# Source only the function definitions (everything before the command
+# dispatch at the bottom, which would otherwise execute on source)
+sed -n '1,/^# Command dispatch$/p' "$SCRIPT" | sed '$d' > "$TMP/funcs.sh"
 # shellcheck source=/dev/null
 source "$TMP/funcs.sh"
 
@@ -375,6 +376,137 @@ PYEOF
 [ $? -eq 0 ] && ok "bytes tracking suite passed" || bad "bytes tracking suite failed"
 
 # ---------------------------------------------------------------------------
+echo "=== 4d. extended protocol (domain, failures, concurrency) ==="
+SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+# TCP echo sink
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(16)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def loop():
+    while True:
+        try: c, _ = sink.accept()
+        except OSError: return
+        threading.Thread(target=echo, args=(c,), daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
+
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      '19360', '127.0.0.1'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+time.sleep(1)
+chk("ext: proxy starts", p.poll() is None)
+
+def connect():
+    s = socket.create_connection(('127.0.0.1', 19360), timeout=5)
+    s.sendall(b'\x05\x01\x00')
+    assert s.recv(2) == b'\x05\x00'
+    return s
+
+# Domain-name CONNECT (ATYP 0x03)
+s = connect()
+domain = b'localhost'
+s.sendall(b'\x05\x01\x00\x03' + bytes([len(domain)]) + domain + struct.pack('>H', tport))
+chk("domain CONNECT reply 0x00", s.recv(10)[1] == 0x00)
+s.sendall(b'domain-ok')
+chk("domain CONNECT relay echo", s.recv(9) == b'domain-ok')
+s.close()
+
+# CONNECT to an unreachable target -> REP 0x01 (general failure)
+s = connect()
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', 1))
+chk("unreachable target -> REP 0x01", s.recv(10)[1] == 0x01)
+s.close()
+
+# Wrong SOCKS version -> connection closed without a reply. The server may
+# tear it down with a clean EOF or a RST (if unread data was pending), so
+# both count as "rejected".
+s = socket.create_connection(('127.0.0.1', 19360), timeout=5)
+s.sendall(b'\x04\x01\x00')   # VER 4 is not SOCKS5
+rejected = False
+try:
+    rejected = s.recv(2) == b''
+except ConnectionResetError:
+    rejected = True
+chk("wrong version rejects connection", rejected)
+s.close()
+
+# UDP ASSOCIATE with FRAG != 0 must be dropped (no reply)
+s = connect()
+s.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+resp = s.recv(10)
+bnd = struct.unpack('>H', resp[8:10])[0]
+# need a UDP sink that echoes so a dropped FRAG datagram is detectable
+us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); us.bind(('127.0.0.1', 0))
+us.settimeout(0.2); uport = us.getsockname()[1]
+def udp_loop():
+    while True:
+        try: d, a = us.recvfrom(4096)
+        except socket.timeout: continue
+        except OSError: return
+        us.sendto(d, a)
+threading.Thread(target=udp_loop, daemon=True).start()
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); c.settimeout(1.5)
+hdr = b'\x00\x00\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', uport)
+c.sendto(b'\x00\x00\x01' + hdr[3:] + b'frag', ('127.0.0.1', bnd))  # FRAG=1
+no_reply = True
+try:
+    c.recvfrom(4096); no_reply = False
+except socket.timeout:
+    pass
+chk("UDP FRAG!=0 datagram dropped", no_reply)
+# and a normal datagram still works on the same association
+c.sendto(hdr + b'after-frag', ('127.0.0.1', bnd))
+rep, _ = c.recvfrom(4096)
+chk("UDP relay still works after FRAG drop", rep[10:] == b'after-frag')
+s.close(); c.close(); us.close()
+
+# Several concurrent TCP connections, each with distinct payloads
+N = 8
+clients = []
+for i in range(N):
+    s = connect()
+    s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+    assert s.recv(10)[1] == 0x00
+    clients.append(s)
+for i, s in enumerate(clients):
+    s.sendall(b'conn-%d' % i)
+for i, s in enumerate(clients):
+    chk("concurrent conn %d echoes its own payload" % i, s.recv(7) == b'conn-%d' % i)
+for s in clients:
+    s.close()
+
+# A larger payload (1 MiB) round-trips intact
+s = connect()
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+big = os.urandom(1024 * 1024)
+s.sendall(big)
+got = b''
+while len(got) < len(big):
+    got += s.recv(65536)
+chk("1 MiB payload round-trips intact", got == big)
+s.close()
+
+p.terminate(); p.wait(); sink.close()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "extended protocol suite passed" || bad "extended protocol suite failed"
+
+# ---------------------------------------------------------------------------
 echo "=== 5. IPv6 listener (skipped if no IPv6 loopback) ==="
 SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
 import os, socket, struct, subprocess, sys, time
@@ -460,6 +592,57 @@ PYEOF
 [ $? -eq 0 ] && ok "auth suite passed" || bad "auth suite failed"
 
 # ---------------------------------------------------------------------------
+echo "=== 6b. auth + UDP ASSOCIATE ==="
+SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+# UDP echo sink
+us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); us.bind(('127.0.0.1', 0))
+us.settimeout(0.2); uport = us.getsockname()[1]
+def udp_loop():
+    while True:
+        try: d, a = us.recvfrom(4096)
+        except socket.timeout: continue
+        except OSError: return
+        us.sendto(d, a)
+threading.Thread(target=udp_loop, daemon=True).start()
+
+env = dict(os.environ)
+env.update({'SOCKS5_USER': 'alice', 'SOCKS5_PASS': 'hunter2'})
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      '19362', '127.0.0.1'], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+time.sleep(1)
+chk("auth+udp: proxy starts", p.poll() is None)
+
+# Authenticated login then UDP ASSOCIATE
+s = socket.create_connection(('127.0.0.1', 19362), timeout=5)
+s.sendall(b'\x05\x01\x02'); assert s.recv(2) == b'\x05\x02'
+s.sendall(b'\x01\x05alice\x07hunter2')
+chk("auth+udp: login accepted", s.recv(2) == b'\x01\x00')
+s.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+resp = s.recv(10)
+chk("auth+udp: ASSOCIATE reply 0x00", resp[1] == 0x00)
+bnd = struct.unpack('>H', resp[8:10])[0]
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); c.settimeout(3)
+hdr = b'\x00\x00\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', uport)
+c.sendto(hdr + b'auth-udp', ('127.0.0.1', bnd))
+rep, _ = c.recvfrom(4096)
+chk("auth+udp: relay echo works", rep[10:] == b'auth-udp')
+s.close(); c.close(); us.close()
+p.terminate(); p.wait()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "auth+udp suite passed" || bad "auth+udp suite failed"
+
+# ---------------------------------------------------------------------------
 echo "=== 7. CLI (set/show/status/version) ==="
 rm -rf "$PREFIX"
 mkdir -p "$CONFIG_DIR"
@@ -488,6 +671,30 @@ chk "--version prints" \
     'bash "$SCRIPT" --version | grep -q "v[0-9]"'
 chk "unknown command rejected" \
     '! bash "$SCRIPT" bogus >/dev/null 2>&1'
+chk "help renders" \
+    'bash "$SCRIPT" help | strip_colors | grep -q "COMMANDS"'
+chk "logs with no log file is harmless" \
+    'bash "$SCRIPT" logs | strip_colors | grep -q "No log file"'
+chk "stop with no pid file is harmless" \
+    'bash "$SCRIPT" stop | strip_colors | grep -q "not running"'
+# Hidden password prompt: `set auth user` with no password argument reads it
+# via read -s, so the password never appears in argv or history.
+chk "set auth prompts hidden for password" \
+    'printf "hunter2\n" | bash "$SCRIPT" set auth promptuser >/dev/null 2>&1 && grep -q "^PROXY_PASS=hunter2$" "$CONFIG_FILE"'
+chk "set auth hidden prompt saved user" \
+    'grep -q "^PROXY_USER=promptuser$" "$CONFIG_FILE"'
+chk "unset auth cleans both keys" \
+    'bash "$SCRIPT" unset auth >/dev/null 2>&1 && ! grep -q "^PROXY_USER=\|^PROXY_PASS=" "$CONFIG_FILE"'
+# format_uptime / format_bytes are pure bash helpers. The uptime checks use
+# range regexes because a second can tick between the arg's `date +%s` and
+# the one computed inside format_uptime (90s -> "1m 30s" or "1m 31s").
+chk "format_uptime seconds"    '[[ "$(format_uptime $(date +%s))" =~ ^(0s|1s)$ ]]'
+chk "format_uptime minutes"    '[[ "$(format_uptime $(( $(date +%s) - 90 )))" =~ ^1m[[:space:]][0-9]+s$ ]]'
+chk "format_uptime hours"      '[[ "$(format_uptime $(( $(date +%s) - 3661 )))" =~ ^1h[[:space:]][0-9]+m[[:space:]][0-9]+s$ ]]'
+chk "format_bytes bytes"       '[ "$(format_bytes 900)" = "900 B" ]'
+chk "format_bytes KiB"         '[ "$(format_bytes 1536)" = "1.5 KiB" ]'
+chk "format_bytes MiB"         '[ "$(format_bytes 3145728)" = "3.0 MiB" ]'
+chk "format_bytes GiB"         '[ "$(format_bytes 5368709120)" = "5.0 GiB" ]'
 
 # ---------------------------------------------------------------------------
 echo "=== 8. end-to-end start/stop ==="
@@ -498,6 +705,26 @@ chk "e2e: status shows running" \
     'bash "$SCRIPT" status | strip_colors | grep -q "Running: yes"'
 chk "e2e: listens on saved port" \
     'python3 -c "import socket; s=socket.create_connection((\"127.0.0.1\",19310),timeout=3); s.close()"'
+# logs follows while running — bounded by timeout so tail -f cannot hang
+# the suite; skipped gracefully on systems without the timeout utility
+if command -v timeout >/dev/null 2>&1; then
+    chk "e2e: logs shows live output" \
+        'timeout 2 bash "$SCRIPT" logs 2>/dev/null | strip_colors | grep -q "SOCKS5 proxy running"'
+else
+    chk "e2e: logs shows live output" \
+        'tail -n 30 "$CONFIG_DIR/proxy.log" | strip_colors | grep -q "SOCKS5 proxy running"'
+fi
+# Restarting while already running must replace the old proxy, not fail
+OLD_PID=$(cat "$CONFIG_DIR/pid")
+( bash "$SCRIPT" start >/dev/null 2>&1 & )
+sleep 4
+NEW_PID=$(cat "$CONFIG_DIR/pid" 2>/dev/null || echo "")
+chk "e2e: restart replaces proxy" \
+    '[ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ] && bash "$SCRIPT" status | strip_colors | grep -q "Running: yes"'
+chk "e2e: old proxy stopped after restart" \
+    '! kill -0 "$OLD_PID" 2>/dev/null'
+chk "e2e: only one proxy after restart" \
+    '[ "$(ps aux | grep -c "[s]ocks5_server")" = "1" ]'
 # Relay real data through the running proxy so the conns file gets an entry
 python3 - <<'PYEOF'
 import socket, struct, subprocess, threading, time
