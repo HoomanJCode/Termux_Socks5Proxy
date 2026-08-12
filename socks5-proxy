@@ -17,11 +17,13 @@
 # ----------------------------------------------------------------------------
 # ANSI escape codes for colored terminal output
 # ----------------------------------------------------------------------------
-GREEN='\033[0;32m'   # green  — success messages / values
-YELLOW='\033[1;33m'  # yellow — informational text
-RED='\033[0;31m'     # red    — errors
-BLUE='\033[0;34m'    # blue   — hints / examples
-NC='\033[0m'         # no color — resets formatting back to default
+# $'...' syntax embeds real escape characters, so the colors work both with
+# echo -e and with cat (e.g. the help text)
+GREEN=$'\033[0;32m'   # green  — success messages / values
+YELLOW=$'\033[1;33m'  # yellow — informational text
+RED=$'\033[0;31m'     # red    — errors
+BLUE=$'\033[0;34m'    # blue   — hints / examples
+NC=$'\033[0m'         # no color — resets formatting back to default
 
 # ----------------------------------------------------------------------------
 # Configuration paths
@@ -227,24 +229,44 @@ get_android_ip() {
 # =============================================================================
 
 usage() {
-    echo -e "${YELLOW}socks5-proxy${NC} — SOCKS5 proxy server for Termux"
-    echo -e ""
-    echo -e "Usage: ${GREEN}socks5-proxy [command] [args]${NC}"
-    echo -e ""
-    echo -e "Commands:"
-    echo -e "  start                 Start the proxy (uses saved port & IP)"
-    echo -e "  stop                  Stop the running proxy"
-    echo -e "  status                Show whether the proxy is running + saved settings"
-    echo -e "  set port <1-65535>    Save the listening port"
-    echo -e "  set ip <IP>           Save the listening IP (0.0.0.0 = all interfaces)"
-    echo -e "  show config           Show the saved port and IP"
-    echo -e "  help                  Show this help"
-    echo -e ""
-    echo -e "Examples:"
-    echo -e "  ${GREEN}socks5-proxy${NC}                  Start with the saved settings"
-    echo -e "  ${GREEN}socks5-proxy 9999${NC}             Start on port 9999 (and save it)"
-    echo -e "  ${GREEN}socks5-proxy set port 1080${NC}    Save port 1080"
-    echo -e "  ${GREEN}socks5-proxy set ip 0.0.0.0${NC}   Listen on all interfaces"
+    cat <<EOF
+${YELLOW}socks5-proxy${NC} — SOCKS5 proxy server for Termux
+
+${GREEN}SYNOPSIS${NC}
+    socks5-proxy [command] [args]
+
+${GREEN}COMMANDS${NC}
+    start                Start the proxy (uses the saved port and IP)
+    stop                 Stop the running proxy
+    status               Show whether the proxy is running + saved settings
+    set port <1-65535>   Save the listening port
+    set ip <IP>          Save the listening IP (0.0.0.0 = all interfaces)
+    show config          Show the saved port and IP
+    help                 Show this help
+
+    <PORT>               Shortcut for start: use <PORT> and save it
+
+${GREEN}EXAMPLES${NC}
+    socks5-proxy                  Start with the saved settings
+    socks5-proxy 9999             Start on port 9999 (and save it)
+    socks5-proxy set port 1080    Save port 1080
+    socks5-proxy set ip 0.0.0.0   Listen on all interfaces
+    socks5-proxy status           Check whether the proxy is running
+    socks5-proxy stop             Stop the running proxy
+
+${GREEN}FIRST RUN${NC}
+    On the first run you are asked for a port (Enter uses the default 1080).
+    The port and listening IP are saved to the config file, so later runs
+    start immediately without any prompt.
+
+${GREEN}FILES${NC}
+    $CONFIG_DIR/config    saved port (PROXY_PORT) and IP (PROXY_IP)
+    $CONFIG_DIR/pid       PID of the running proxy
+
+${RED}SECURITY${NC}
+    The proxy has no authentication and is open to anyone who can reach it.
+    Only run it on networks you trust, and stop it when unused.
+EOF
 }
 
 # ----------------------------------------------------------------------------
