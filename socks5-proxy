@@ -25,6 +25,9 @@ RED=$'\033[0;31m'     # red    — errors
 BLUE=$'\033[0;34m'    # blue   — hints / examples
 NC=$'\033[0m'         # no color — resets formatting back to default
 
+# Current version of this tool (shown by `socks5-proxy --version`)
+VERSION="1.0.0"
+
 # ----------------------------------------------------------------------------
 # Configuration paths
 # $PREFIX is Termux's install root (e.g. /data/data/com.termux/files/usr),
@@ -283,7 +286,8 @@ ${GREEN}SYNOPSIS${NC}
 ${GREEN}COMMANDS${NC}
     start                Start the proxy (uses the saved port and IP)
     stop                 Stop the running proxy
-    status               Show whether the proxy is running + saved settings
+    status               Show running state + saved settings + live stats
+    logs                 Show the proxy log (follows when running)
     set port <1-65535>   Save the listening port
     set ip <IP>          Save the listening IP (IPv4 or IPv6 literal)
                          0.0.0.0 / :: = all interfaces
@@ -292,6 +296,7 @@ ${GREEN}COMMANDS${NC}
     unset auth           Disable authentication
     show config          Show the saved port, IP, and auth state
     help                 Show this help
+    --version            Show the version
 
     <PORT>               Shortcut for start: use <PORT> and save it
 
@@ -305,6 +310,7 @@ ${GREEN}EXAMPLES${NC}
     socks5-proxy set ip 0.0.0.0   Listen on all interfaces (IPv4)
     socks5-proxy set ip ::        Listen on all interfaces (IPv4 + IPv6)
     socks5-proxy status           Check whether the proxy is running
+    socks5-proxy logs             Watch live connections
     socks5-proxy stop             Stop the running proxy
 
 ${GREEN}FIRST RUN${NC}
@@ -313,8 +319,10 @@ ${GREEN}FIRST RUN${NC}
     start immediately without any prompt.
 
 ${GREEN}FILES${NC}
-    $CONFIG_DIR/config    saved port (PROXY_PORT) and IP (PROXY_IP)
-    $CONFIG_DIR/pid       PID of the running proxy
+    $CONFIG_DIR/config      saved port (PROXY_PORT) and IP (PROXY_IP)
+    $CONFIG_DIR/pid         PID of the running proxy
+    $CONFIG_DIR/proxy.log   proxy output (view with `logs`)
+    $CONFIG_DIR/stats       live stats for `status` (uptime, connections)
 
 ${RED}SECURITY${NC}
     The proxy has no authentication and is open to anyone who can reach it.
@@ -433,6 +441,30 @@ udp_sock = None
 # one too (a fresh connection would otherwise be handled by a new thread
 # and brute force would go unhindered)
 auth_lock = threading.Lock()
+
+# Live stats for the launcher's `status` command. The launcher passes a
+# stats-file path via the SOCKS5_STATS environment variable; a background
+# thread refreshes the file every couple of seconds.
+STATS_FILE = os.environ.get('SOCKS5_STATS', '')
+START_TIME = time.time()
+_stats_lock = threading.Lock()
+_active_conns = 0
+_total_conns = 0
+
+
+def stats_writer():
+    """Periodically persist live connection stats for the launcher."""
+    if not STATS_FILE:
+        return
+    while True:
+        with _stats_lock:
+            try:
+                with open(STATS_FILE, 'w') as f:
+                    f.write('START=%d\nACTIVE=%d\nTOTAL=%d\n' % (
+                        int(START_TIME), _active_conns, _total_conns))
+            except OSError:
+                pass
+        time.sleep(2)
 
 
 def tune_socket(sock):
@@ -562,6 +594,7 @@ def udp_relay(udp_sock, client_addr, tcp_sock):
 
 def handle_client(client_socket):
     """Handle a single SOCKS5 client connection on its own thread."""
+    global _active_conns
     try:
         # --- SOCKS5 handshake (client greeting) -----------------------------
         # First message: VER(1) NMETHODS(1) METHODS(NMETHODS) — max 257 bytes
@@ -725,12 +758,15 @@ def handle_client(client_socket):
     except Exception as e:
         pass   # any unexpected error: just drop this client
     finally:
+        # Decrement the live-connection counter (protected by the stats lock)
+        with _stats_lock:
+            _active_conns -= 1
         client_socket.close()
 
 
 def main():
     """Create the listening socket and serve clients forever."""
-    global udp_sock
+    global udp_sock, _active_conns, _total_conns
     # An IPv6 bind address (e.g. "::" for all interfaces) uses AF_INET6,
     # with dual-stack enabled when the kernel allows it
     if ':' in BIND_IP:
@@ -755,11 +791,17 @@ def main():
     print(f"SOCKS5 proxy running on {BIND_IP}:{PORT}")
     print("Ready for connections...")
 
+    # Keep the launcher's `status` command up to date with live stats
+    threading.Thread(target=stats_writer, daemon=True).start()
+
     # Accept loop: hand each incoming client to its own daemon thread
     while True:
         client, addr = server.accept()
         tune_socket(client)   # apply latency + buffer tuning to the peer
         print(f"Connection from {addr[0]}:{addr[1]}")
+        with _stats_lock:
+            _active_conns += 1
+            _total_conns += 1
         threading.Thread(target=handle_client, args=(client,), daemon=True).start()
 
 
@@ -775,15 +817,20 @@ EOL
     AUTH_USER=$(get_stored_user)
     AUTH_PASS=$(get_stored_pass)
 
+    # Output goes to a log file (view it with `socks5-proxy logs`) and live
+    # stats are written for the `status` command. Credentials stay in env vars.
+    # -u keeps the log output unbuffered so `socks5-proxy logs` sees it live
     if command -v setsid >/dev/null 2>&1; then
-        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" \
-            setsid nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
+        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" \
+            setsid nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
+            > "$CONFIG_DIR/proxy.log" 2>&1 &
     else
         # setsid missing: the proxy stays in our process group, so Ctrl+C would
         # kill it too — warn the user instead of silently claiming it's safe
         echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
-        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" \
-            nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
+        SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" \
+            nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
+            > "$CONFIG_DIR/proxy.log" 2>&1 &
     fi
 PROXY_PID=$!
 echo "$PROXY_PID" > "$PID_FILE"
@@ -836,6 +883,7 @@ echo -e ""
 echo -e "${YELLOW}Commands:${NC}"
 echo -e "   Stop:        ${GREEN}socks5-proxy stop${NC}"
 echo -e "   Status:      ${GREEN}socks5-proxy status${NC}"
+echo -e "   Logs:        ${GREEN}socks5-proxy logs${NC}"
 echo -e "   Change port: ${GREEN}socks5-proxy set port <PORT>${NC}"
 echo -e "   Change IP:   ${GREEN}socks5-proxy set ip <IP>${NC}"
 echo -e "   Uninstall:   ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-proxy${NC}"
@@ -861,6 +909,23 @@ is_running() {
 }
 
 # ----------------------------------------------------------------------------
+# format_uptime — turn a start timestamp into a human-readable duration
+#   Args: $1 = Unix epoch seconds when the proxy started
+# ----------------------------------------------------------------------------
+format_uptime() {
+    local secs=$(( $(date +%s) - ${1:-0} ))
+    [ "$secs" -lt 0 ] && secs=0
+    local d=$((secs / 86400)) h=$(((secs % 86400) / 3600))
+    local m=$(((secs % 3600) / 60)) s=$((secs % 60))
+    local out=""
+    [ "$d" -gt 0 ] && out+="${d}d "
+    [ "$h" -gt 0 ] && out+="${h}h "
+    [ "$m" -gt 0 ] && out+="${m}m "
+    out+="${s}s"
+    echo "$out"
+}
+
+# ----------------------------------------------------------------------------
 # show_status — print whether the proxy is running and the saved settings
 # ----------------------------------------------------------------------------
 show_status() {
@@ -879,10 +944,38 @@ show_status() {
     [ "$running" = "yes" ] && echo -e "   PID:     ${GREEN}$pid${NC}"
     echo -e "   Port:    ${GREEN}${port:-1080 (default)}${NC}"
     echo -e "   Listen:  ${GREEN}${ip:-0.0.0.0 (all interfaces)}${NC}"
+    if [ "$running" = "yes" ] && [ -f "$CONFIG_DIR/stats" ]; then
+        # Live stats written by the proxy every few seconds
+        local start_t active total
+        start_t=$(sed -n 's/^START=//p' "$CONFIG_DIR/stats" | head -1)
+        active=$(sed -n 's/^ACTIVE=//p' "$CONFIG_DIR/stats" | head -1)
+        total=$(sed -n 's/^TOTAL=//p' "$CONFIG_DIR/stats" | head -1)
+        [ -n "$start_t" ] && echo -e "   Uptime:  ${GREEN}$(format_uptime "$start_t")${NC}"
+        [ -n "$active" ] && echo -e "   Active:  ${GREEN}${active}${NC} connection(s), ${total:-0} total"
+    fi
     if [ -n "$user" ]; then
         echo -e "   Auth:    ${GREEN}on (user: $user)${NC}"
     else
         echo -e "   Auth:    ${YELLOW}off${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# show_logs — show the proxy's log output
+#   Follows live (tail -f) when running; shows the last lines otherwise
+# ----------------------------------------------------------------------------
+show_logs() {
+    local logfile="$CONFIG_DIR/proxy.log"
+    if [ ! -f "$logfile" ]; then
+        echo -e "${YELLOW}ℹ️  No log file yet — start the proxy first.${NC}"
+        return 0
+    fi
+    if is_running; then
+        echo -e "${GREEN}📜 Proxy log (Ctrl+C to stop following):${NC}"
+        tail -n 30 -f "$logfile"
+    else
+        echo -e "${YELLOW}ℹ️  Proxy is not running — showing the last lines:${NC}"
+        tail -n 30 "$logfile"
     fi
 }
 
@@ -989,6 +1082,12 @@ case "$CMD" in
         ;;
     status)
         show_status
+        ;;
+    logs)
+        show_logs
+        ;;
+    version|-V|--version)
+        echo -e "socks5-proxy ${GREEN}v$VERSION${NC}"
         ;;
     set)
         case "${2:-}" in
