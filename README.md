@@ -18,7 +18,7 @@ connection details. Later runs start instantly with the saved settings.
 - 🔄 Handles IPv4, domain names, and IPv6 — as CONNECT targets **and** as the
   listening address (`set ip ::` = dual-stack)
 - 📦 UDP ASSOCIATE (RFC 1928) — UDP-based apps (video calls, games, DNS) work
-  through the proxy too
+  through the proxy too, with multiple concurrent clients supported
 - 🛡️ Restarts cleanly — a PID file tracks the running proxy, and a previous
   instance is verified and stopped before starting a new one
 - 🧵 Per-connection threading, partial-read safe, `sendall`-based relay
@@ -145,9 +145,11 @@ curl --socks5 <USER>:<PASS>@<PHONE_IP>:<PORT> https://api.ipify.org
 | `$PREFIX/etc/socks5-proxy/stats` | Live stats for `status` (uptime, connections) |
 
 The proxy listens on the configured IP (default `0.0.0.0` — all interfaces)
-at the chosen port. It relays TCP and UDP traffic in both directions using
-one thread per connection. `status` reads the live stats file written by the
-server every couple of seconds.
+at the chosen port. It relays TCP traffic in both directions with one thread
+per connection; UDP ASSOCIATE uses a dedicated dispatcher thread that routes
+each datagram to its client's own relay thread, so concurrent UDP clients
+never steal each other's packets. `status` reads the live stats file written
+by the server every couple of seconds.
 
 ## Testing
 
