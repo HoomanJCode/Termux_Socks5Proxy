@@ -26,7 +26,9 @@ connection details. Later runs start instantly with the saved settings.
   kernel socket buffers for low-latency, high-throughput transfers
 - 🔒 Optional username/password authentication (RFC 1929), off by default,
   with hidden password prompt and brute-force throttling
-- 📊 Live stats in `status` (uptime, active connections) and a `logs` command
+- 📊 Live stats in `status` (uptime, active connections, bytes relayed) and
+  a `logs` command, plus the most recent connections with per-connection
+  byte counts
 
 ## Requirements
 
@@ -92,7 +94,7 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 | `socks5-proxy` | Start the proxy (uses the saved port & IP) |
 | `socks5-proxy 9999` | Start on port 9999 (and save it) |
 | `socks5-proxy stop` | Stop the running proxy |
-| `socks5-proxy status` | Show running state + saved settings + live stats |
+| `socks5-proxy status` | Show running state + saved settings + live stats (bytes, recent connections) |
 | `socks5-proxy logs` | Show the proxy log (follows live while running) |
 | `socks5-proxy set port 1080` | Save the listening port |
 | `socks5-proxy set ip 192.168.1.10` | Save the listening IP (`0.0.0.0` = all IPv4 interfaces, `::` = all IPv4 + IPv6) |
@@ -142,14 +144,16 @@ curl --socks5 <USER>:<PASS>@<PHONE_IP>:<PORT> https://api.ipify.org
 | `$PREFIX/etc/socks5-proxy/socks5_server.py` | The generated Python SOCKS5 server |
 | `$PREFIX/etc/socks5-proxy/pid` | PID of the currently running proxy |
 | `$PREFIX/etc/socks5-proxy/proxy.log` | Proxy output (view with `socks5-proxy logs`) |
-| `$PREFIX/etc/socks5-proxy/stats` | Live stats for `status` (uptime, connections) |
+| `$PREFIX/etc/socks5-proxy/stats` | Live stats for `status` (uptime, connections, bytes) |
+| `$PREFIX/etc/socks5-proxy/conns` | Recent connections with bytes relayed (for `status`) |
 
 The proxy listens on the configured IP (default `0.0.0.0` — all interfaces)
 at the chosen port. It relays TCP traffic in both directions with one thread
 per connection; UDP ASSOCIATE uses a dedicated dispatcher thread that routes
 each datagram to its client's own relay thread, so concurrent UDP clients
 never steal each other's packets. `status` reads the live stats file written
-by the server every couple of seconds.
+by the server every couple of seconds, plus a list of recent connections
+with how many bytes were relayed in each direction.
 
 ## Testing
 
