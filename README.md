@@ -51,9 +51,19 @@ socks5-proxy
 
 - **First run:** you'll be asked for a port (Enter uses the default `1080`).
   The port is saved, so later runs start immediately with no prompt.
-- **Switch ports:** pass the port as an argument, e.g. `socks5-proxy 9999` —
-  or delete the config with `rm $PREFIX/etc/socks5-proxy/config` to be asked
-  again on the next run.
+
+### CLI commands
+
+| Command | Description |
+|---------|-------------|
+| `socks5-proxy` | Start the proxy (uses the saved port & IP) |
+| `socks5-proxy 9999` | Start on port 9999 (and save it) |
+| `socks5-proxy stop` | Stop the running proxy |
+| `socks5-proxy status` | Show whether the proxy is running + saved settings |
+| `socks5-proxy set port 1080` | Save the listening port |
+| `socks5-proxy set ip 192.168.1.10` | Save the listening IP (`0.0.0.0` = all interfaces) |
+| `socks5-proxy show config` | Show the saved port and IP |
+| `socks5-proxy help` | Show the help screen |
 
 ### Configure your other devices
 
@@ -76,16 +86,17 @@ If it prints your public IP, the proxy is working.
 | Action | Command |
 |--------|---------|
 | Start | `socks5-proxy` |
-| Stop | `kill $(cat $PREFIX/etc/socks5-proxy/pid)` |
-| Check status | `ps aux \| grep socks5` |
-| Change port | `socks5-proxy <PORT>` (or `rm $PREFIX/etc/socks5-proxy/config` to be prompted again) |
+| Stop | `socks5-proxy stop` |
+| Status | `socks5-proxy status` |
+| Change port | `socks5-proxy set port 1080` |
+| Change listening IP | `socks5-proxy set ip 0.0.0.0` |
 | Uninstall | `rm -rf $PREFIX/etc/socks5-proxy && rm $PREFIX/bin/socks5-proxy` |
 
 ## How it works
 
 | File | Purpose |
 |------|---------|
-| `$PREFIX/etc/socks5-proxy/config` | Remembers the last used port |
+| `$PREFIX/etc/socks5-proxy/config` | Remembers the port and listening IP |
 | `$PREFIX/etc/socks5-proxy/socks5_server.py` | The generated Python SOCKS5 server |
 | `$PREFIX/etc/socks5-proxy/pid` | PID of the currently running proxy |
 

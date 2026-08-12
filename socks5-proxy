@@ -52,11 +52,47 @@ get_stored_port() {
 }
 
 # ----------------------------------------------------------------------------
+# get_stored_ip — read the saved listening IP (if any)
+#
+# Returns (via stdout): the stored IP, or "" if none is saved yet.
+# ----------------------------------------------------------------------------
+get_stored_ip() {
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^PROXY_IP=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
+    else
+        echo ""   # no config file yet -> no stored IP
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# save_config — update a single key=value line in the config file, keeping
+#   any other settings intact
+#   Args: $1 = key, $2 = value
+# ----------------------------------------------------------------------------
+save_config() {
+    local key="$1" value="$2"
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG_FILE"
+    # Keep every line except an existing entry for this key, then append
+    grep -v "^$key=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null || true
+    echo "$key=$value" >> "$CONFIG_FILE.tmp"
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+# ----------------------------------------------------------------------------
 # save_port — persist the chosen port so it can be reused next time
 #   Args: $1 = the port number to remember
 # ----------------------------------------------------------------------------
 save_port() {
-    echo "PROXY_PORT=$1" > "$CONFIG_FILE"
+    save_config "PROXY_PORT" "$1"
+}
+
+# ----------------------------------------------------------------------------
+# save_ip — persist the listening IP address
+#   Args: $1 = the IP to bind to (e.g. 0.0.0.0 or a LAN address)
+# ----------------------------------------------------------------------------
+save_ip() {
+    save_config "PROXY_IP" "$1"
 }
 
 # ----------------------------------------------------------------------------
@@ -66,6 +102,20 @@ save_port() {
 # ----------------------------------------------------------------------------
 is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# ----------------------------------------------------------------------------
+# is_valid_ip — check whether a value is a valid IPv4 address
+#   Args: $1 = the value to validate
+#   Returns: 0 (valid) if all four octets are numbers from 0 to 255
+# ----------------------------------------------------------------------------
+is_valid_ip() {
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local IFS='.' octet
+    for octet in $1; do
+        # 10# forces base-10 so leading zeros (e.g. 192.168.08.1) work
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
 }
 
 # ----------------------------------------------------------------------------
@@ -173,43 +223,93 @@ get_android_ip() {
 }
 
 # =============================================================================
-# Main script execution starts here
+# Command-line interface
 # =============================================================================
 
-# 1) Choose the port (saved port is used automatically; the first argument
-#    can override it, e.g. `socks5-proxy 9999`)
-get_port "$1"
+usage() {
+    echo -e "${YELLOW}socks5-proxy${NC} — SOCKS5 proxy server for Termux"
+    echo -e ""
+    echo -e "Usage: ${GREEN}socks5-proxy [command] [args]${NC}"
+    echo -e ""
+    echo -e "Commands:"
+    echo -e "  start                 Start the proxy (uses saved port & IP)"
+    echo -e "  stop                  Stop the running proxy"
+    echo -e "  status                Show whether the proxy is running + saved settings"
+    echo -e "  set port <1-65535>    Save the listening port"
+    echo -e "  set ip <IP>           Save the listening IP (0.0.0.0 = all interfaces)"
+    echo -e "  show config           Show the saved port and IP"
+    echo -e "  help                  Show this help"
+    echo -e ""
+    echo -e "Examples:"
+    echo -e "  ${GREEN}socks5-proxy${NC}                  Start with the saved settings"
+    echo -e "  ${GREEN}socks5-proxy 9999${NC}             Start on port 9999 (and save it)"
+    echo -e "  ${GREEN}socks5-proxy set port 1080${NC}    Save port 1080"
+    echo -e "  ${GREEN}socks5-proxy set ip 0.0.0.0${NC}   Listen on all interfaces"
+}
 
-echo -e ""
-echo -e "${YELLOW}⏳ Starting SOCKS5 proxy on port $PORT...${NC}"
+# ----------------------------------------------------------------------------
+# stop_proxy — stop the running proxy using the PID file
+#   Args: optional -q for quiet mode (used before starting a new instance)
+# ----------------------------------------------------------------------------
+stop_proxy() {
+    local quiet=0
+    [ "${1:-}" = "-q" ] && quiet=1
 
-# 2) Stop any leftover proxy from a previous session, using the PID file.
-#    We verify the PID still belongs to our own server script before killing
-#    it, so an unrelated process can never be killed by mistake.
-if [ -f "$PID_FILE" ]; then
+    if [ ! -f "$PID_FILE" ]; then
+        [ "$quiet" -eq 1 ] || echo -e "${YELLOW}ℹ️  Proxy is not running (no PID file).${NC}"
+        return 0
+    fi
+
+    local old_pid
     old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null \
         && grep -q "socks5_server.py" "/proc/$old_pid/cmdline" 2>/dev/null; then
-        echo -e "${YELLOW}⏹  Stopping old proxy (PID $old_pid)...${NC}"
+        [ "$quiet" -eq 1 ] || echo -e "${YELLOW}⏹  Stopping proxy (PID $old_pid)...${NC}"
         kill "$old_pid" 2>/dev/null || true
         sleep 1   # give it a moment to release the port
         rm -f "$PID_FILE"
+        [ "$quiet" -eq 1 ] || echo -e "${GREEN}✅ Proxy stopped.${NC}"
     elif [ -z "$old_pid" ] || ! kill -0 "$old_pid" 2>/dev/null; then
-        # Process is gone (or the PID file is garbage) — safe to discard
+        # Process is gone or the PID file is garbage — safe to discard
         rm -f "$PID_FILE"
+        [ "$quiet" -eq 1 ] || echo -e "${YELLOW}ℹ️  No running proxy found — removed stale PID file.${NC}"
     fi
     # Otherwise (process alive but identity unverifiable): keep the PID file
     # so we don't lose track of the running proxy.
-fi
+}
 
-# 3) Make sure Python is installed; install it via Termux's package manager
+# ----------------------------------------------------------------------------
+# start_proxy — start the SOCKS5 proxy in the background
+#   Args: optional port override (also saved)
+# ----------------------------------------------------------------------------
+start_proxy() {
+    # 1) Choose the port (saved port is used automatically; the first argument
+    #    can override it, e.g. `socks5-proxy 9999`)
+    get_port "$1"
+
+    # 2) Choose the bind IP (saved IP, or all interfaces by default)
+    BIND_IP=$(get_stored_ip)
+    if [ -z "$BIND_IP" ]; then
+        BIND_IP="0.0.0.0"
+    elif ! is_valid_ip "$BIND_IP"; then
+        echo -e "${YELLOW}⚠️  Saved IP '$BIND_IP' is invalid — listening on all interfaces.${NC}"
+        BIND_IP="0.0.0.0"
+    fi
+
+    echo -e ""
+    echo -e "${YELLOW}⏳ Starting SOCKS5 proxy on $BIND_IP:$PORT...${NC}"
+
+    # 3) Stop any leftover proxy from a previous session
+    stop_proxy -q
+
+# 4) Make sure Python is installed; install it via Termux's package manager
 #    if it is missing.
 if ! command -v python &> /dev/null; then
     echo -e "${YELLOW}📦 Installing Python...${NC}"
     pkg install python -y
 fi
 
-# 4) Generate the Python SOCKS5 server.
+# 5) Generate the Python SOCKS5 server.
 #    NOTE: the heredoc delimiter is quoted ('EOL'), so no variable expansion
 #    happens — the script is written to disk exactly as shown below.
 cat > "$CONFIG_DIR/socks5_server.py" << 'EOL'
@@ -232,6 +332,8 @@ import struct
 
 # Listening port: taken from the command line, defaulting to 1080
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
+# Bind address: taken from the command line, defaulting to all interfaces
+BIND_IP = sys.argv[2] if len(sys.argv) > 2 else '0.0.0.0'
 # Read/write chunk size for relaying traffic
 BUFFER_SIZE = 4096
 
@@ -360,11 +462,11 @@ def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Allow immediate rebinding after the proxy is killed/restarted
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Listen on all interfaces so other devices on the network can connect
-    server.bind(('0.0.0.0', PORT))
+    # Listen on the configured address (0.0.0.0 = all interfaces)
+    server.bind((BIND_IP, PORT))
     server.listen(50)
 
-    print(f"SOCKS5 proxy running on 0.0.0.0:{PORT}")
+    print(f"SOCKS5 proxy running on {BIND_IP}:{PORT}")
     print("Ready for connections...")
 
     # Accept loop: hand each incoming client to its own daemon thread
@@ -378,22 +480,22 @@ if __name__ == "__main__":
     main()
 EOL
 
-# 5) Launch the proxy in a new session so Ctrl+C on this script can never
+# 6) Launch the proxy in a new session so Ctrl+C on this script can never
 #    kill it: setsid detaches it from the terminal's process group (falling
 #    back to plain nohup if setsid is unavailable), and nohup ignores SIGHUP.
 #    The PID is saved so future runs can stop it cleanly.
 if command -v setsid >/dev/null 2>&1; then
-    setsid nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" > /dev/null 2>&1 &
+    setsid nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
 else
     # setsid missing: the proxy stays in our process group, so Ctrl+C would
     # kill it too — warn the user instead of silently claiming it's safe
     echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
-    nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" > /dev/null 2>&1 &
+    nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" > /dev/null 2>&1 &
 fi
 PROXY_PID=$!
 echo "$PROXY_PID" > "$PID_FILE"
 
-# 6) Give the server a moment to start, then verify it is still alive
+# 7) Give the server a moment to start, then verify it is still alive
 sleep 2
 
 if ps -p $PROXY_PID > /dev/null 2>&1; then
@@ -402,14 +504,14 @@ else
     # The process died — show the user how to run it manually to see the error
     echo -e "${RED}❌ Failed to start proxy${NC}"
     echo -e "${YELLOW}Try running manually:${NC}"
-    echo -e "   ${GREEN}python $CONFIG_DIR/socks5_server.py $PORT${NC}"
+    echo -e "   ${GREEN}python $CONFIG_DIR/socks5_server.py $PORT $BIND_IP${NC}"
     exit 1
 fi
 
-# 7) Detect the device IP so the user knows what address to connect to
+# 8) Detect the device IP so the user knows what address to connect to
 ANDROID_IP=$(get_android_ip)
 
-# 8) Print the summary: connection details, test command, and useful commands
+# 9) Print the summary: connection details, test command, and useful commands
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}✅ SOCKS5 PROXY IS RUNNING!${NC}"
 echo -e "${GREEN}========================================${NC}"
@@ -418,6 +520,7 @@ echo -e "${YELLOW}📱 On your PC, configure:${NC}"
 echo -e "   Type: ${GREEN}SOCKS5${NC}"
 echo -e "   Host: ${GREEN}${ANDROID_IP}${NC}"
 echo -e "   Port: ${GREEN}${PORT}${NC}"
+echo -e "   Listening on: ${GREEN}${BIND_IP}:${PORT}${NC}"
 echo -e ""
 echo -e "${YELLOW}🧪 Test with curl:${NC}"
 echo -e "   ${GREEN}curl --socks5 ${ANDROID_IP}:${PORT} https://api.ipify.org${NC}"
@@ -430,13 +533,138 @@ echo -e "${RED}⚠️  Security: No authentication! Use only on trusted networks
 echo -e "${GREEN}========================================${NC}"
 echo -e ""
 echo -e "${YELLOW}Commands:${NC}"
-echo -e "   Stop proxy: ${GREEN}kill \$(cat $CONFIG_DIR/pid)${NC}"
-echo -e "   Check status: ${GREEN}ps aux | grep socks5${NC}"
-echo -e "   Change port: ${GREEN}rm $CONFIG_FILE && socks5-proxy${NC}"
-echo -e "   Uninstall: ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-proxy${NC}"
+echo -e "   Stop:        ${GREEN}socks5-proxy stop${NC}"
+echo -e "   Status:      ${GREEN}socks5-proxy status${NC}"
+echo -e "   Change port: ${GREEN}socks5-proxy set port <PORT>${NC}"
+echo -e "   Change IP:   ${GREEN}socks5-proxy set ip <IP>${NC}"
+echo -e "   Uninstall:   ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-proxy${NC}"
 echo -e ""
 echo -e "${YELLOW}Press Ctrl+C to exit (proxy stays running)${NC}"
 
-# 9) Keep the script alive so the user can read the output;
-#    `wait` blocks until the background proxy is killed.
-wait
+# 10) Keep the script alive so the user can read the output;
+#     `wait` blocks until the background proxy is killed.
+    wait
+}
+
+# ----------------------------------------------------------------------------
+# is_running — check whether our proxy is currently running
+#   Returns: 0 if running, 1 otherwise
+# ----------------------------------------------------------------------------
+is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    grep -q "socks5_server.py" "/proc/$pid/cmdline" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# show_status — print whether the proxy is running and the saved settings
+# ----------------------------------------------------------------------------
+show_status() {
+    local running="no" pid=""
+    if is_running; then
+        running="yes"
+        pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    fi
+
+    local port=$(get_stored_port)
+    local ip=$(get_stored_ip)
+
+    echo -e "${GREEN}===== SOCKS5 Proxy Status =====${NC}"
+    echo -e "   Running: ${GREEN}$running${NC}"
+    [ "$running" = "yes" ] && echo -e "   PID:     ${GREEN}$pid${NC}"
+    echo -e "   Port:    ${GREEN}${port:-1080 (default)}${NC}"
+    echo -e "   Listen:  ${GREEN}${ip:-0.0.0.0 (all interfaces)}${NC}"
+}
+
+# ----------------------------------------------------------------------------
+# set_port — save the listening port
+#   Args: $1 = port number (1-65535)
+# ----------------------------------------------------------------------------
+set_port() {
+    if ! is_valid_port "${1:-}"; then
+        echo -e "${RED}❌ Invalid port: '${1:-}' (must be a number from 1 to 65535)${NC}"
+        exit 1
+    fi
+    save_port "$1"
+    echo -e "${GREEN}✅ Port set to $1.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy stop && socks5-proxy).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# set_ip — save the listening IP address
+#   Args: $1 = IPv4 address (0.0.0.0 = all interfaces)
+# ----------------------------------------------------------------------------
+set_ip() {
+    if ! is_valid_ip "${1:-}"; then
+        echo -e "${RED}❌ Invalid IP address: '${1:-}'${NC}"
+        exit 1
+    fi
+    save_ip "$1"
+    echo -e "${GREEN}✅ Listen IP set to $1.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy stop && socks5-proxy).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# show_config — print the saved configuration
+# ----------------------------------------------------------------------------
+show_config() {
+    echo -e "${YELLOW}📁 Saved configuration:${NC}"
+    echo -e "   Port: ${GREEN}$(get_stored_port)${NC}"
+    echo -e "   IP:   ${GREEN}$(get_stored_ip)${NC}"
+}
+
+# =============================================================================
+# Command dispatch
+# =============================================================================
+
+CMD="${1:-start}"
+
+case "$CMD" in
+    start)
+        start_proxy "$2"
+        ;;
+    stop)
+        stop_proxy
+        ;;
+    status)
+        show_status
+        ;;
+    set)
+        case "${2:-}" in
+            port) set_port "${3:-}" ;;
+            ip)   set_ip "${3:-}" ;;
+            *)
+                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>}${NC}"
+                exit 1
+                ;;
+        esac
+        ;;
+    show)
+        if [ "${2:-}" = "config" ]; then
+            show_config
+        else
+            echo -e "${RED}❌ Usage: socks5-proxy show config${NC}"
+            exit 1
+        fi
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        # A plain number is a shortcut for `socks5-proxy start <PORT>`
+        if is_valid_port "$CMD"; then
+            start_proxy "$CMD"
+        else
+            echo -e "${RED}❌ Unknown command: '$CMD'${NC}"
+            usage
+            exit 1
+        fi
+        ;;
+esac
