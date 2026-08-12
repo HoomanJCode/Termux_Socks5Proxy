@@ -11,6 +11,7 @@
 # Files managed by this script:
 #   $PREFIX/etc/socks5-proxy/config            -> remembers the last port used
 #   $PREFIX/etc/socks5-proxy/socks5_server.py  -> the generated Python server
+#   $PREFIX/etc/socks5-proxy/pid               -> PID of the running proxy
 # =============================================================================
 
 # ----------------------------------------------------------------------------
@@ -29,6 +30,7 @@ NC='\033[0m'         # no color — resets formatting back to default
 # ----------------------------------------------------------------------------
 CONFIG_DIR="$PREFIX/etc/socks5-proxy"
 CONFIG_FILE="$CONFIG_DIR/config"
+PID_FILE="$CONFIG_DIR/pid"
 
 # Ensure the config directory exists before writing into it
 mkdir -p "$CONFIG_DIR"
@@ -40,9 +42,10 @@ mkdir -p "$CONFIG_DIR"
 # ----------------------------------------------------------------------------
 get_stored_port() {
     if [ -f "$CONFIG_FILE" ]; then
-        # Load the config file so its PROXY_PORT variable becomes available
-        source "$CONFIG_FILE"
-        echo "$PROXY_PORT"
+        # Parse the config file instead of sourcing it — a tampered or
+        # malformed config can never execute arbitrary code this way.
+        # (tr -d '\r' strips carriage returns from Windows-edited files.)
+        sed -n 's/^PROXY_PORT=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
     else
         echo ""   # no config file yet -> no stored port
     fi
@@ -57,6 +60,15 @@ save_port() {
 }
 
 # ----------------------------------------------------------------------------
+# is_valid_port — check whether a value is a usable TCP port number
+#   Args: $1 = the value to validate
+#   Returns: 0 (valid) if it is a number in the range 1-65535, 1 otherwise
+# ----------------------------------------------------------------------------
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# ----------------------------------------------------------------------------
 # get_port — interactively ask the user for a listening port
 #
 # Behavior:
@@ -68,6 +80,7 @@ save_port() {
 get_port() {
     # The port saved by the previous run, if any
     local stored_port=$(get_stored_port)
+    local prompt
 
     # Banner header
     echo -e "${GREEN}========================================${NC}"
@@ -79,27 +92,32 @@ get_port() {
         # A port is already saved -> offer it as the default choice
         echo -e "${YELLOW}📌 Last used port: ${GREEN}$stored_port${NC}"
         echo -e "${YELLOW}Press Enter to use same port, or type a new port:${NC}"
-        read -p "Port [$stored_port]: " USER_PORT
-        if [ -z "$USER_PORT" ]; then
-            # User pressed Enter -> keep the stored port
-            PORT=$stored_port
-        else
-            # User typed a new port -> use and save it
-            PORT=$USER_PORT
-            save_port $PORT
-        fi
+        prompt="Port [$stored_port]: "
     else
         # First run -> ask for a port from scratch
         echo -e "${YELLOW}📝 Enter the port number you want to use:${NC}"
         echo -e "${BLUE}   (e.g., 1080 is the default SOCKS port)${NC}"
-        read -p "Port: " PORT
-        if [ -z "$PORT" ]; then
-            # User pressed Enter -> fall back to the standard SOCKS port
-            PORT=1080
-            echo -e "${YELLOW}Using default port: $PORT${NC}"
-        fi
-        save_port $PORT
+        prompt="Port [1080]: "
     fi
+
+    # Keep asking until a valid port is given (Enter = use the default)
+    while true; do
+        read -p "$prompt" PORT
+        if [ -z "$PORT" ]; then
+            # Empty input -> default: the stored port, or 1080 on first run.
+            # If the stored port is corrupt, fall back to the safe default.
+            PORT="${stored_port:-1080}"
+            if ! is_valid_port "$PORT"; then
+                PORT=1080
+            fi
+            echo -e "${YELLOW}Using port: $PORT${NC}"
+        fi
+        if is_valid_port "$PORT"; then
+            break   # valid input, proceed
+        fi
+        echo -e "${RED}❌ Invalid port: '$PORT' (must be a number from 1 to 65535)${NC}"
+    done
+    save_port "$PORT"
 }
 
 # ----------------------------------------------------------------------------
@@ -153,10 +171,24 @@ get_port
 echo -e ""
 echo -e "${YELLOW}⏳ Starting SOCKS5 proxy on port $PORT...${NC}"
 
-# 2) Kill any leftover proxy process that may still be running from a
-#    previous session (matching either the server script name or the port).
-pkill -f "python.*socks5_server" 2>/dev/null || true
-pkill -f "python.*$PORT" 2>/dev/null || true
+# 2) Stop any leftover proxy from a previous session, using the PID file.
+#    We verify the PID still belongs to our own server script before killing
+#    it, so an unrelated process can never be killed by mistake.
+if [ -f "$PID_FILE" ]; then
+    old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null \
+        && grep -q "socks5_server.py" "/proc/$old_pid/cmdline" 2>/dev/null; then
+        echo -e "${YELLOW}⏹  Stopping old proxy (PID $old_pid)...${NC}"
+        kill "$old_pid" 2>/dev/null || true
+        sleep 1   # give it a moment to release the port
+        rm -f "$PID_FILE"
+    elif [ -z "$old_pid" ] || ! kill -0 "$old_pid" 2>/dev/null; then
+        # Process is gone (or the PID file is garbage) — safe to discard
+        rm -f "$PID_FILE"
+    fi
+    # Otherwise (process alive but identity unverifiable): keep the PID file
+    # so we don't lose track of the running proxy.
+fi
 
 # 3) Make sure Python is installed; install it via Termux's package manager
 #    if it is missing.
@@ -334,10 +366,20 @@ if __name__ == "__main__":
     main()
 EOL
 
-# 5) Launch the proxy in the background, detached from this terminal
-#    (nohup keeps it alive even if this script exits).
-nohup python "$CONFIG_DIR/socks5_server.py" $PORT > /dev/null 2>&1 &
+# 5) Launch the proxy in a new session so Ctrl+C on this script can never
+#    kill it: setsid detaches it from the terminal's process group (falling
+#    back to plain nohup if setsid is unavailable), and nohup ignores SIGHUP.
+#    The PID is saved so future runs can stop it cleanly.
+if command -v setsid >/dev/null 2>&1; then
+    setsid nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" > /dev/null 2>&1 &
+else
+    # setsid missing: the proxy stays in our process group, so Ctrl+C would
+    # kill it too — warn the user instead of silently claiming it's safe
+    echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
+    nohup python "$CONFIG_DIR/socks5_server.py" "$PORT" > /dev/null 2>&1 &
+fi
 PROXY_PID=$!
+echo "$PROXY_PID" > "$PID_FILE"
 
 # 6) Give the server a moment to start, then verify it is still alive
 sleep 2
@@ -376,7 +418,7 @@ echo -e "${RED}⚠️  Security: No authentication! Use only on trusted networks
 echo -e "${GREEN}========================================${NC}"
 echo -e ""
 echo -e "${YELLOW}Commands:${NC}"
-echo -e "   Stop proxy: ${GREEN}pkill -f socks5_server.py${NC}"
+echo -e "   Stop proxy: ${GREEN}kill \$(cat $CONFIG_DIR/pid)${NC}"
 echo -e "   Check status: ${GREEN}ps aux | grep socks5${NC}"
 echo -e "   Change port: ${GREEN}rm $CONFIG_FILE && socks5-proxy${NC}"
 echo -e "   Uninstall: ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-proxy${NC}"
