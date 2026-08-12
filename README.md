@@ -18,6 +18,8 @@ connection details. Later runs start instantly with the saved settings.
 - 🛡️ Restarts cleanly — a PID file tracks the running proxy, and a previous
   instance is verified and stopped before starting a new one
 - 🧵 Per-connection threading, partial-read safe, `sendall`-based relay
+- ⚡ Performance-tuned: 64 KiB relay buffers, `TCP_NODELAY`, and larger
+  kernel socket buffers for low-latency, high-throughput transfers
 
 ## Requirements
 

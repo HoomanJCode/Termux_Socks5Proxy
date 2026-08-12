@@ -356,8 +356,24 @@ import struct
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
 # Bind address: taken from the command line, defaulting to all interfaces
 BIND_IP = sys.argv[2] if len(sys.argv) > 2 else '0.0.0.0'
-# Read/write chunk size for relaying traffic
-BUFFER_SIZE = 4096
+# Relay chunk size: 64 KiB reduces syscall overhead and improves throughput
+BUFFER_SIZE = 65536
+# Requested kernel socket buffer size (Linux doubles the requested value)
+SOCK_BUF_SIZE = 262144
+
+
+def tune_socket(sock):
+    """Apply performance tweaks to a connected socket."""
+    try:
+        # Disable Nagle's algorithm — lower latency for interactive traffic
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Larger kernel buffers — fewer stalls under load
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF_SIZE)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF_SIZE)
+        # Detect dead peers instead of hanging forever
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass   # unsupported option — keep the kernel default
 
 
 def recv_exact(sock, n):
@@ -437,6 +453,7 @@ def handle_client(client_socket):
             target_socket.settimeout(30)          # timeout only the connect
             target_socket.connect((addr, port))   # establish the connection
             target_socket.settimeout(None)        # blocking once connected
+            tune_socket(target_socket)            # latency + buffer tuning
         except Exception as e:
             # Send a failure reply (REP 0x01 = general failure) and give up
             client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
@@ -494,6 +511,7 @@ def main():
     # Accept loop: hand each incoming client to its own daemon thread
     while True:
         client, addr = server.accept()
+        tune_socket(client)   # apply latency + buffer tuning to the peer
         print(f"Connection from {addr[0]}:{addr[1]}")
         threading.Thread(target=handle_client, args=(client,), daemon=True).start()
 
