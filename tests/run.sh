@@ -318,6 +318,23 @@ chk "e2e: no leftover proxy" \
 rm -rf "$PREFIX"
 
 # ---------------------------------------------------------------------------
+echo "=== 9. install.sh ==="
+INSTALL_DIR="$TMP/install-prefix"
+chk "install: copies into \$PREFIX/bin and is executable" \
+    'bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" >/dev/null 2>&1 && [ -x "$INSTALL_DIR/bin/socks5-proxy" ]'
+chk "install: copy is byte-identical" \
+    'cmp -s "$SCRIPT" "$INSTALL_DIR/bin/socks5-proxy"'
+chk "install: installed script runs" \
+    'PREFIX="$INSTALL_DIR" bash "$INSTALL_DIR/bin/socks5-proxy" --version | grep -q "v[0-9]"'
+chk "install: re-install is an update, still works" \
+    'bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" >/dev/null 2>&1 && cmp -s "$SCRIPT" "$INSTALL_DIR/bin/socks5-proxy"'
+chk "install: --uninstall removes it" \
+    'bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" --uninstall >/dev/null 2>&1 && [ ! -f "$INSTALL_DIR/bin/socks5-proxy" ]'
+chk "install: unknown option rejected" \
+    '! bash "$ROOT/install.sh" --bogus >/dev/null 2>&1'
+rm -rf "$INSTALL_DIR"
+
+# ---------------------------------------------------------------------------
 echo
 echo "=============================="
 echo "  $PASS passed, $FAIL failed"
