@@ -144,14 +144,20 @@ is_valid_port() {
 }
 
 # ----------------------------------------------------------------------------
-# is_valid_ip — check whether a value is a valid IPv4 address
+# is_valid_ip — check whether a value is a valid IP address
 #   Args: $1 = the value to validate
-#   Returns: 0 (valid) if all four octets are numbers from 0 to 255
+#   Returns: 0 (valid) for a well-formed IPv4 address or IPv6 literal
 # ----------------------------------------------------------------------------
 is_valid_ip() {
-    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local ip="$1"
+    # IPv6 literal (e.g. ::, ::1, fe80::1) — validate with Python's parser
+    if [[ "$ip" == *:* ]]; then
+        python3 -c "import socket,sys; socket.inet_pton(socket.AF_INET6, sys.argv[1])" "$ip" 2>/dev/null
+        return $?
+    fi
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
     local IFS='.' octet
-    for octet in $1; do
+    for octet in $ip; do
         # 10# forces base-10 so leading zeros (e.g. 192.168.08.1) work
         [ "$((10#$octet))" -le 255 ] || return 1
     done
@@ -277,7 +283,8 @@ ${GREEN}COMMANDS${NC}
     stop                 Stop the running proxy
     status               Show whether the proxy is running + saved settings
     set port <1-65535>   Save the listening port
-    set ip <IP>          Save the listening IP (0.0.0.0 = all interfaces)
+    set ip <IP>          Save the listening IP (IPv4 or IPv6 literal)
+                         0.0.0.0 / :: = all interfaces
     set auth <u> <pass>  Save a username/password (RFC 1929 auth)
     unset auth           Disable authentication
     show config          Show the saved port, IP, and auth state
@@ -292,7 +299,8 @@ ${GREEN}EXAMPLES${NC}
     socks5-proxy                  Start with the saved settings
     socks5-proxy 9999             Start on port 9999 (and save it)
     socks5-proxy set port 1080    Save port 1080
-    socks5-proxy set ip 0.0.0.0   Listen on all interfaces
+    socks5-proxy set ip 0.0.0.0   Listen on all interfaces (IPv4)
+    socks5-proxy set ip ::        Listen on all interfaces (IPv4 + IPv6)
     socks5-proxy status           Check whether the proxy is running
     socks5-proxy stop             Stop the running proxy
 
@@ -414,6 +422,9 @@ AUTH_USER = os.environ.get('SOCKS5_USER', '')
 AUTH_PASS = os.environ.get('SOCKS5_PASS', '')
 AUTH_REQUIRED = bool(AUTH_USER)
 
+# Shared UDP socket used for UDP ASSOCIATE relay (created in main())
+udp_sock = None
+
 
 def tune_socket(sock):
     """Apply performance tweaks to a connected socket."""
@@ -443,6 +454,101 @@ def recv_exact(sock, n):
             break   # connection closed before n bytes arrived
         data += chunk
     return data
+
+
+def udp_relay(udp_sock, client_addr, tcp_sock):
+    """Relay UDP datagrams for one client (RFC 1928 UDP ASSOCIATE).
+
+    The client sends datagrams to our UDP socket, each prefixed with the
+    SOCKS5 UDP header (RSV FRAG ATYP ADDR PORT). We forward the payload to
+    the target and send replies back with the same header so the client
+    knows which destination each reply came from.
+
+    Runs on the client's own thread. A single shared UDP socket is used, so
+    this is simplest with one client at a time (the typical phone case);
+    datagrams from other clients are ignored.
+    """
+    target = None
+    dest = None
+    # The client's UDP socket often uses a different port than its TCP
+    # connection, so match on IP and reply to the UDP source address.
+    client_ip = client_addr[0]
+    client_udp = None
+    udp_sock.settimeout(1.0)     # wake up periodically to check TCP side
+    tcp_sock.setblocking(False)
+    try:
+        while True:
+            # Closing the TCP association tears the UDP relay down
+            try:
+                if tcp_sock.recv(1, socket.MSG_PEEK) == b'':
+                    break
+            except (BlockingIOError, OSError):
+                pass
+            try:
+                data, src = udp_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            # Re-check the TCP association now that a datagram arrived:
+            # the client may have closed it while we were blocked waiting
+            try:
+                if tcp_sock.recv(1, socket.MSG_PEEK) == b'':
+                    break
+            except (BlockingIOError, OSError):
+                pass
+            if src[0] != client_ip:
+                continue   # datagram from another client — ignore
+            if client_udp is None:
+                client_udp = src   # remember where the client listens
+            elif src != client_udp:
+                continue   # datagram from an unexpected UDP socket
+            if len(data) < 4 or data[2] != 0:
+                continue   # FRAG != 0 (fragmentation) is unsupported
+            atyp = data[3]
+            try:
+                if atyp == 0x01:   # IPv4
+                    addr = socket.inet_ntoa(data[4:8])
+                    reply_hdr = data[3:8]           # ATYP + IPv4 address
+                    family = socket.AF_INET
+                    off = 8
+                elif atyp == 0x03:   # domain name
+                    dlen = data[4]
+                    addr = data[5:5 + dlen].decode('utf-8')
+                    reply_hdr = data[3:5 + dlen]    # ATYP + len + name
+                    family = socket.AF_INET
+                    off = 5 + dlen
+                elif atyp == 0x04:   # IPv6
+                    addr = socket.inet_ntop(socket.AF_INET6, data[4:20])
+                    reply_hdr = data[3:20]          # ATYP + IPv6 address
+                    family = socket.AF_INET6
+                    off = 20
+                else:
+                    continue   # unknown address type
+                port = struct.unpack('>H', data[off:off + 2])[0]
+                payload = data[off + 2:]
+                # (Re)open the target socket when the destination changes
+                if dest != (addr, port):
+                    if target:
+                        target.close()
+                    target = socket.socket(family, socket.SOCK_DGRAM)
+                    target.settimeout(0.5)
+                    dest = (addr, port)
+                target.sendto(payload, dest)
+                # Forward any replies from the target back to the client
+                while True:
+                    try:
+                        resp, _ = target.recvfrom(65535)
+                    except socket.timeout:
+                        break
+                    udp_sock.sendto(
+                        b'\x00\x00\x00' + reply_hdr + struct.pack('>H', port) + resp,
+                        client_udp)
+            except (OSError, ValueError, IndexError):
+                continue   # malformed datagram — drop it
+    except OSError:
+        pass
+    finally:
+        if target:
+            target.close()
 
 
 def handle_client(client_socket):
@@ -510,9 +616,9 @@ def handle_client(client_socket):
         cmd = header[1]    # command: CONNECT / BIND / UDP ASSOCIATE
         atyp = header[3]   # address type: IPv4 / domain name / IPv6
 
-        # Only the CONNECT command is supported — reject BIND (0x02) and
-        # UDP ASSOCIATE (0x03) with REP 0x07 (command not supported)
-        if ver != 0x05 or cmd != 0x01:
+        # CONNECT (0x01) and UDP ASSOCIATE (0x03) are supported; BIND (0x02)
+        # is rejected with REP 0x07 (command not supported)
+        if ver != 0x05 or cmd not in (0x01, 0x03):
             client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
             client_socket.close()
             return
@@ -534,6 +640,25 @@ def handle_client(client_socket):
         else:
             # Unknown address type -> drop the connection
             client_socket.close()
+            return
+
+        if cmd == 0x03:
+            # --- UDP ASSOCIATE ------------------------------------------------
+            # Tell the client where to send UDP datagrams: the same port, on
+            # the address the client actually reached us through (so it works
+            # even when listening on 0.0.0.0). Then relay until the client
+            # closes the TCP association.
+            try:
+                bnd_ip = client_socket.getsockname()[0]
+            except OSError:
+                bnd_ip = BIND_IP
+            if ':' in bnd_ip:
+                response = b'\x05\x00\x00\x04' + socket.inet_pton(socket.AF_INET6, bnd_ip)
+            else:
+                response = b'\x05\x00\x00\x01' + socket.inet_aton(bnd_ip)
+            response += struct.pack('>H', PORT)
+            client_socket.sendall(response)
+            udp_relay(udp_sock, client_socket.getpeername(), client_socket)
             return
 
         # --- Connect to the requested target --------------------------------
@@ -587,12 +712,27 @@ def handle_client(client_socket):
 
 def main():
     """Create the listening socket and serve clients forever."""
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    global udp_sock
+    # An IPv6 bind address (e.g. "::" for all interfaces) uses AF_INET6,
+    # with dual-stack enabled when the kernel allows it
+    if ':' in BIND_IP:
+        server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        try:
+            server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass   # dual-stack unsupported — IPv6 only
+    else:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Allow immediate rebinding after the proxy is killed/restarted
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # Listen on the configured address (0.0.0.0 = all interfaces)
     server.bind((BIND_IP, PORT))
     server.listen(50)
+
+    # UDP socket for the UDP ASSOCIATE relay (same port number as TCP)
+    udp_sock = socket.socket(server.family, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_sock.bind((BIND_IP, PORT))
 
     print(f"SOCKS5 proxy running on {BIND_IP}:{PORT}")
     print("Ready for connections...")
