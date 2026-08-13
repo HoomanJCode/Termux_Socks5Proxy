@@ -1034,21 +1034,24 @@ def handle_client(client_socket):
         # once BOTH have stopped, so a half-closed peer (a client that
         # finished sending but is still reading, e.g. a download) keeps
         # receiving in-flight replies.
-        state = {'last': time.time(), 'left': 2}
+        state = {'last': time.time(), 'left': 2, 'reason': {}}
         client_socket.settimeout(1)
         target_socket.settimeout(1)
 
         def forward(src, dst, direction):
             """Copy data from `src` to `dst`, counting bytes in `direction`."""
+            reason = 'eof'   # src closed -> we half-close dst and stop
             try:
                 while True:
                     try:
                         data = src.recv(BUFFER_SIZE)
                     except socket.timeout:
                         if done.is_set():
-                            break   # the tunnel is being torn down
+                            reason = 'teardown'   # the other direction ended
+                            break
                         if time.time() - state['last'] > IDLE_TIMEOUT:
                             done.set()   # idle too long — wind everything down
+                            reason = 'idle'
                             break
                         continue
                     if not data:
@@ -1066,10 +1069,11 @@ def handle_client(client_socket):
                         state['last'] = time.time()
                         counters[direction] += len(data)
             except OSError:
-                pass            # connection reset / closed — stop copying
+                reason = 'reset'   # connection reset / closed — stop copying
             finally:
                 # Close both sockets only when this was the last direction
                 with _stats_lock:
+                    state['reason'][direction] = reason
                     state['left'] -= 1
                     if state['left'] == 0:
                         done.set()
@@ -1079,9 +1083,18 @@ def handle_client(client_socket):
         up_thread = threading.Thread(
             target=forward, args=(client_socket, target_socket, 'up'),
             daemon=True)
+        log('debug', 'tunnel %s -> %s:%d established' % (peer, addr, port))
         up_thread.start()
         forward(target_socket, client_socket, 'down')
         up_thread.join(timeout=5)   # let the last client->target bytes count
+
+        # At debug level, report why each direction ended so the user can see
+        # whether the proxy closed it (idle) or a peer did (eof/reset)
+        log('debug', 'tunnel %s -> %s:%d closed: up=%s down=%s '
+            'up_bytes=%d down_bytes=%d secs=%.0fs'
+            % (peer, addr, port, state['reason'].get('up', '?'),
+               state['reason'].get('down', '?'), counters['up'],
+               counters['down'], time.time() - started))
 
         # Record this connection for the launcher's `status` command. Like the
         # UDP side, only connections that actually moved data are listed.
