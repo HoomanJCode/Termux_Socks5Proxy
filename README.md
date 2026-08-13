@@ -60,12 +60,18 @@ socks5-proxy
 
 On first run, Python will be installed automatically if needed.
 
+Re-running the installer **updates** an existing installation: it compares
+versions (the same version is a no-op), prints the `old → new` version
+change, and — if the proxy is running — restarts it with the new code so
+the update takes effect immediately.
+
 ### Installer options
 
 | Command | Description |
 |---------|-------------|
-| `bash install.sh` | Install or update `socks5-proxy` |
+| `bash install.sh` | Install, or update an existing installation |
 | `bash install.sh --prefix /path` | Install into `/path/bin` instead of `$PREFIX` |
+| `bash install.sh --no-restart` | Update without restarting a running proxy |
 | `bash install.sh --uninstall` | Remove the installed copy (settings are kept) |
 | `bash install.sh --help` | Show usage |
 
