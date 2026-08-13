@@ -35,7 +35,7 @@ connection details. Later runs start instantly with the saved settings.
   with hidden password prompt and brute-force throttling
 - 📊 Live stats in `status` (uptime, active connections, bytes relayed) and
   a `logs` command, plus the most recent connections with per-connection
-  byte counts
+  byte counts — and a live watch mode (`status -w`) that redraws in place
 
 ## Requirements
 
@@ -110,6 +110,7 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 | `socks5-proxy restart` | Stop and start again (applies saved changes) |
 | `socks5-proxy reset` | Restart with fresh traffic counters (clears stats + conns) |
 | `socks5-proxy status` | Show running state + saved settings + live stats (bytes, recent connections) |
+| `socks5-proxy status -w [secs]` | Live-updating status, redrawn every N seconds (default 2) — Ctrl+C to stop |
 | `socks5-proxy logs` | Show the proxy log (follows live while running) |
 | `socks5-proxy set port 1080` | Save the listening port |
 | `socks5-proxy set ip 192.168.1.10` | Save the listening IP (`0.0.0.0` = all IPv4 interfaces, `::` = all IPv4 + IPv6) |
