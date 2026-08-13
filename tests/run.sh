@@ -614,6 +614,214 @@ PYEOF
 [ $? -eq 0 ] && ok "limits suite passed" || bad "limits suite failed"
 
 # ---------------------------------------------------------------------------
+echo "=== 4f. connection type matrix (commands x address types) ==="
+python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+def have_v6():
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.bind(('::1', 0)); s.close(); return True
+    except OSError:
+        return False
+V6 = have_v6()
+
+# --- TCP echo sink -------------------------------------------------------
+ts = socket.socket(); ts.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+ts.bind(('127.0.0.1', 0)); ts.listen(5); tport = ts.getsockname()[1]
+def tcp_echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def tcp_loop():
+    while True:
+        try: c, _ = ts.accept()
+        except OSError: return
+        threading.Thread(target=tcp_echo, args=(c,), daemon=True).start()
+threading.Thread(target=tcp_loop, daemon=True).start()
+
+v6sink = None
+if V6:
+    v6sink = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    v6sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    v6sink.bind(('::1', 0)); v6sink.listen(5); v6tport = v6sink.getsockname()[1]
+    def v6_loop():
+        while True:
+            try: c, _ = v6sink.accept()
+            except OSError: return
+            threading.Thread(target=tcp_echo, args=(c,), daemon=True).start()
+    threading.Thread(target=v6_loop, daemon=True).start()
+
+# --- UDP echo sink -------------------------------------------------------
+us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); us.bind(('127.0.0.1', 0))
+us.settimeout(0.2); uport = us.getsockname()[1]
+def udp_loop():
+    while True:
+        try: d, a = us.recvfrom(4096)
+        except socket.timeout: continue
+        except OSError: return
+        us.sendto(d, a)
+threading.Thread(target=udp_loop, daemon=True).start()
+
+# --- servers: plain + auth-enabled ---------------------------------------
+srv_port = 19305
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      str(srv_port), '127.0.0.1'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+env = dict(os.environ, SOCKS5_USER='alice', SOCKS5_PASS='hunter2')
+auth_port = 19306
+pa = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                       str(auth_port), '127.0.0.1'], env=env,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+time.sleep(1)
+chk("proxy starts", p.poll() is None)
+chk("auth proxy starts", pa.poll() is None)
+
+def handshake(port, methods=b'\x00'):
+    s = socket.create_connection(('127.0.0.1', port), timeout=5)
+    s.settimeout(5)
+    s.sendall(b'\x05' + bytes([len(methods)]) + methods)
+    return s, s.recv(2)
+
+def connect_req(port, cmd, atyp, addr_bytes, dst_port):
+    s, _ = handshake(port)
+    s.sendall(b'\x05' + bytes([cmd]) + b'\x00' + bytes([atyp])
+              + addr_bytes + struct.pack('>H', dst_port))
+    return s
+
+# --- TCP CONNECT: every address type -------------------------------------
+s = connect_req(srv_port, 0x01, 0x01, socket.inet_aton('127.0.0.1'), tport)
+chk("CONNECT IPv4 -> REP 0x00", s.recv(10)[1] == 0x00)
+s.sendall(b'ipv4'); chk("CONNECT IPv4 relays", s.recv(4) == b'ipv4')
+s.close()
+
+s = connect_req(srv_port, 0x01, 0x03, b'\x09localhost', tport)
+chk("CONNECT domain -> REP 0x00", s.recv(10)[1] == 0x00)
+s.sendall(b'dom'); chk("CONNECT domain relays", s.recv(3) == b'dom')
+s.close()
+
+if V6:
+    s = connect_req(srv_port, 0x01, 0x04,
+                    socket.inet_pton(socket.AF_INET6, '::1'), v6tport)
+    chk("CONNECT IPv6 -> REP 0x00", s.recv(10)[1] == 0x00)
+    s.sendall(b'v6t'); chk("CONNECT IPv6 relays", s.recv(3) == b'v6t')
+    s.close()
+else:
+    print("SKIP - CONNECT IPv6 target (no IPv6 loopback)")
+
+# unknown ATYP in the request -> connection dropped without a reply
+s = socket.create_connection(('127.0.0.1', srv_port), timeout=5)
+s.settimeout(3)
+s.sendall(b'\x05\x01\x00'); assert s.recv(2) == b'\x05\x00'
+s.sendall(b'\x05\x01\x00\x05\x01\x02\x03\x04\x00\x01')   # ATYP 5
+closed = False
+try:
+    closed = s.recv(10) == b''
+except (ConnectionResetError, socket.timeout):
+    closed = True
+chk("CONNECT unknown ATYP -> dropped", closed)
+s.close()
+
+# unknown command -> REP 0x07 (same as BIND)
+s = connect_req(srv_port, 0x04, 0x01, socket.inet_aton('127.0.0.1'), tport)
+chk("unknown CMD -> REP 0x07", s.recv(10)[1] == 0x07)
+s.close()
+
+s = connect_req(srv_port, 0x02, 0x01, socket.inet_aton('127.0.0.1'), 1)
+chk("BIND -> REP 0x07", s.recv(10)[1] == 0x07)
+s.close()
+
+# --- UDP ASSOCIATE: target address types inside the datagram --------------
+def udp_assoc(port=srv_port):
+    t, _ = handshake(port)
+    t.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+    resp = t.recv(10)
+    assert resp[1] == 0x00
+    bnd = struct.unpack('>H', resp[8:10])[0]
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(4)
+    return t, u, bnd
+
+def udp_roundtrip(u, bnd, hdr, payload):
+    u.sendto(hdr + payload, ('127.0.0.1', bnd))
+    return u.recvfrom(65536)[0]
+
+hdr4 = b'\x00\x00\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', uport)
+t, u, bnd = udp_assoc()
+rep = udp_roundtrip(u, bnd, hdr4, b'udp4')
+chk("UDP IPv4 target echo", rep[10:] == b'udp4')
+t.close(); u.close()
+
+name = b'localhost'
+hdr3 = b'\x00\x00\x00\x03' + bytes([len(name)]) + name + struct.pack('>H', uport)
+t, u, bnd = udp_assoc()
+rep = udp_roundtrip(u, bnd, hdr3, b'udp-dom')
+off = 3 + 1 + 1 + len(name) + 2
+chk("UDP domain target echo", rep[off:] == b'udp-dom')
+chk("UDP domain reply carries ATYP+name",
+    rep[3:5] == b'\x03\x09' and rep[5:14] == name)
+t.close(); u.close()
+
+if V6:
+    u6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); u6.bind(('::1', 0))
+    u6.settimeout(0.2); u6port = u6.getsockname()[1]
+    def udp6_loop():
+        while True:
+            try: d, a = u6.recvfrom(4096)
+            except socket.timeout: continue
+            except OSError: return
+            u6.sendto(d, a)
+    threading.Thread(target=udp6_loop, daemon=True).start()
+    hdr6 = b'\x00\x00\x00\x04' + socket.inet_pton(socket.AF_INET6, '::1') \
+        + struct.pack('>H', u6port)
+    t, u, bnd = udp_assoc()
+    rep = udp_roundtrip(u, bnd, hdr6, b'udp6')
+    chk("UDP IPv6 target echo", rep[22:] == b'udp6')
+    t.close(); u.close(); u6.close()
+else:
+    print("SKIP - UDP IPv6 target (no IPv6 loopback)")
+
+# unknown ATYP inside a datagram -> dropped, association keeps working
+t, u, bnd = udp_assoc()
+u.sendto(b'\x00\x00\x00\x05' + socket.inet_aton('127.0.0.1')
+         + struct.pack('>H', uport) + b'bad', ('127.0.0.1', bnd))
+dropped = True
+try:
+    u.recvfrom(65536); dropped = False
+except socket.timeout:
+    pass
+chk("UDP unknown ATYP datagram dropped", dropped)
+rep = udp_roundtrip(u, bnd, hdr4, b'alive')
+chk("UDP association survives bad datagram", rep[10:] == b'alive')
+t.close(); u.close()
+
+# --- authentication method negotiation ------------------------------------
+s, r = handshake(auth_port, b'\x00')         # offers only no-auth
+chk("auth on, no-auth offered -> REP 0xFF", r == b'\x05\xff')
+s.close()
+s, r = handshake(auth_port, b'\x00\x02')     # offers no-auth AND user/pass
+chk("auth on, user/pass offered -> method 0x02", r == b'\x05\x02')
+s.close()
+s, r = handshake(srv_port, b'\x00\x02')      # auth off
+chk("auth off -> no-auth method 0x00", r == b'\x05\x00')
+s.close()
+
+p.terminate(); p.wait(); pa.terminate(); pa.wait()
+ts.close(); us.close()
+if v6sink: v6sink.close()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "connection type matrix passed" || bad "connection type matrix failed"
+
+# ---------------------------------------------------------------------------
 echo "=== 5. IPv6 listener (skipped if no IPv6 loopback) ==="
 SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
 import os, socket, struct, subprocess, sys, time
