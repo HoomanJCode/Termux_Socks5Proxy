@@ -97,6 +97,28 @@ get_stored_pass() {
 }
 
 # ----------------------------------------------------------------------------
+# get_stored_idle — read the saved idle timeout in seconds (if any)
+# ----------------------------------------------------------------------------
+get_stored_idle() {
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^IDLE_TIMEOUT=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
+    else
+        echo ""   # no config file yet -> default is used
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# get_stored_maxconns — read the saved max simultaneous connections (if any)
+# ----------------------------------------------------------------------------
+get_stored_maxconns() {
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^MAX_CONNS=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
+    else
+        echo ""   # no config file yet -> default is used
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # remove_config — delete a key=value line from the config file
 #   Args: $1 = key to remove
 # ----------------------------------------------------------------------------
@@ -286,6 +308,8 @@ ${GREEN}SYNOPSIS${NC}
 ${GREEN}COMMANDS${NC}
     start                Start the proxy (uses the saved port and IP)
     stop                 Stop the running proxy
+    restart              Stop and start the proxy again
+    reset                Restart and clear traffic counters (stats + conns)
     status               Show running state + saved settings + live stats
     logs                 Show the proxy log (follows when running)
     set port <1-65535>   Save the listening port
@@ -293,7 +317,11 @@ ${GREEN}COMMANDS${NC}
                          0.0.0.0 / :: = all interfaces
     set auth <u> [pass]  Save a username/password (RFC 1929 auth)
                        (password omitted -> prompted hidden)
+    set idle <secs>      Save the idle timeout: connections with no traffic
+                         are closed after this long (default 600s)
+    set maxconns <n>     Save the max simultaneous connections (default 256)
     unset auth           Disable authentication
+    unset idle|maxconns  Restore the defaults for the limit above
     show config          Show the saved port, IP, and auth state
     help                 Show this help
     --version            Show the version
@@ -309,6 +337,10 @@ ${GREEN}EXAMPLES${NC}
     socks5-proxy set port 1080    Save port 1080
     socks5-proxy set ip 0.0.0.0   Listen on all interfaces (IPv4)
     socks5-proxy set ip ::        Listen on all interfaces (IPv4 + IPv6)
+    socks5-proxy set idle 900     Close connections idle for 15 minutes
+    socks5-proxy set maxconns 64  Allow at most 64 simultaneous connections
+    socks5-proxy restart          Apply saved changes without stopping first
+    socks5-proxy reset            Restart with fresh traffic counters
     socks5-proxy status           Check whether the proxy is running
     socks5-proxy logs             Watch live connections
     socks5-proxy stop             Stop the running proxy
@@ -319,9 +351,11 @@ ${GREEN}FIRST RUN${NC}
     start immediately without any prompt.
 
 ${GREEN}FILES${NC}
-    $CONFIG_DIR/config      saved port (PROXY_PORT) and IP (PROXY_IP)
+    $CONFIG_DIR/config      saved settings: PROXY_PORT, PROXY_IP, PROXY_USER/PASS,
+                            IDLE_TIMEOUT, MAX_CONNS
     $CONFIG_DIR/pid         PID of the running proxy
-    $CONFIG_DIR/proxy.log   proxy output (view with \`logs\`)
+    $CONFIG_DIR/proxy.log   proxy output (view with \`logs\`; rotated to
+                            proxy.log.1 when larger than 1 MiB)
     $CONFIG_DIR/stats       live stats for \`status\` (uptime, connections, bytes)
     $CONFIG_DIR/conns       recent connections with bytes relayed (for \`status\`)
 
@@ -366,6 +400,18 @@ stop_proxy() {
 # start_proxy — start the SOCKS5 proxy in the background
 #   Args: optional port override (also saved)
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# rotate_log — cap the log file so it can't grow without bound on a phone.
+#   Called before each start; a log over 1 MiB is moved aside (one backup).
+# ----------------------------------------------------------------------------
+rotate_log() {
+    local logfile="$CONFIG_DIR/proxy.log" max=1048576
+    [ -f "$logfile" ] || return 0
+    if [ "$(wc -c < "$logfile" 2>/dev/null || echo 0)" -gt "$max" ]; then
+        mv -f "$logfile" "$logfile.1" 2>/dev/null || true
+    fi
+}
+
 start_proxy() {
     # 1) Choose the port (saved port is used automatically; the first argument
     #    can override it, e.g. `socks5-proxy 9999`)
@@ -385,6 +431,9 @@ start_proxy() {
 
     # 3) Stop any leftover proxy from a previous session
     stop_proxy -q
+
+    # 3b) Rotate the log if it has grown past 1 MiB
+    rotate_log
 
 # 4) Make sure Python is installed; install it via Termux's package manager
 #    if it is missing.
@@ -417,6 +466,7 @@ import socket
 import threading
 import sys
 import struct
+import errno
 import hmac
 import time
 import queue
@@ -430,6 +480,22 @@ BIND_IP = sys.argv[2] if len(sys.argv) > 2 else '0.0.0.0'
 BUFFER_SIZE = 65536
 # Requested kernel socket buffer size (Linux doubles the requested value)
 SOCK_BUF_SIZE = 262144
+# A relay (TCP or UDP) that moves no data for this many seconds is torn down,
+# freeing its thread and sockets. Configurable via the SOCKS5_IDLE_TIMEOUT
+# environment variable (the launcher reads it from the config file).
+# The tolerance fallback keeps the server alive even if the env value was
+# hand-edited to something non-numeric.
+def _env_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except ValueError:
+        return int(default)
+
+IDLE_TIMEOUT = _env_int('SOCKS5_IDLE_TIMEOUT', '600')
+# Maximum simultaneous client connections. Extra clients are closed without a
+# handshake, protecting threads and memory from connection floods.
+# Configurable via SOCKS5_MAX_CONNS.
+MAX_CONNS = _env_int('SOCKS5_MAX_CONNS', '256')
 
 # Optional RFC 1929 username/password authentication. Disabled by default:
 # it only kicks in when SOCKS5_USER is set (the launcher provides it).
@@ -654,27 +720,30 @@ def _drain_replies(assoc, block=0):
     """Send replies waiting on the target socket back to the client, with
     headers. Non-blocking by default; when `block` is non-zero, wait up to
     that many seconds for the first reply (used when the client is idle, so
-    its replies arrive promptly instead of on the next poll)."""
+    its replies arrive promptly instead of on the next poll).
+    Returns True if at least one reply was delivered (i.e. traffic flowed)."""
     target = assoc.target
     if target is None or assoc.client_udp is None:
-        return
+        return False
     if block:
         target.settimeout(block)
+    got = False
     while True:
         try:
             resp, _ = target.recvfrom(65535)
         except BlockingIOError:
-            return   # nothing waiting — done for now
+            return got   # nothing waiting — done for now
         except socket.timeout:
-            return
+            return got
         except OSError:
-            return
+            return got
         hdr = b'\x00\x00\x00' + assoc.reply_hdr + struct.pack('>H', assoc.dest_port)
         try:
             udp_sock.sendto(hdr + resp, assoc.client_udp)
             assoc.bytes_down += len(resp)
+            got = True
         except OSError:
-            return
+            return got
 
 
 def udp_client_loop(assoc):
@@ -682,8 +751,13 @@ def udp_client_loop(assoc):
     global _bytes_up, _bytes_down, _recent_conns
     tcp = assoc.tcp_sock
     tcp.setblocking(False)
+    last_active = time.time()   # bumped whenever traffic flows
     try:
         while True:
+            # Idle associations are closed too, so a client that opened a
+            # UDP ASSOCIATE and then went silent can't hold a thread forever
+            if time.time() - last_active > IDLE_TIMEOUT:
+                break
             # Closing the TCP association tears the relay down
             try:
                 if tcp.recv(1, socket.MSG_PEEK) == b'':
@@ -699,12 +773,15 @@ def udp_client_loop(assoc):
                 data = None
             if data is not None:
                 _relay_datagram(assoc, data, src)
-                _drain_replies(assoc)
+                last_active = time.time()
+                if _drain_replies(assoc):
+                    last_active = time.time()
             else:
                 # Idle: wait briefly for a reply so it arrives at RTT speed
                 # instead of on the next poll, without stalling the loop
                 # while datagrams are still queued.
-                _drain_replies(assoc, block=0.1)
+                if _drain_replies(assoc, block=0.1):
+                    last_active = time.time()
     except OSError:
         pass
     finally:
@@ -878,8 +955,22 @@ def handle_client(client_socket):
             target_socket.settimeout(None)        # blocking once connected
             tune_socket(target_socket)            # latency + buffer tuning
         except Exception as e:
-            # Send a failure reply (REP 0x01 = general failure) and give up
-            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            # Map the failure to the closest SOCKS5 reply code so real
+            # clients can tell a refused host from an unreachable one
+            if isinstance(e, (socket.timeout, socket.gaierror)) or \
+                    (isinstance(e, OSError) and e.errno in (
+                        errno.ENETUNREACH, errno.EHOSTUNREACH,
+                        errno.ENETDOWN, errno.EADDRNOTAVAIL)):
+                rep = 0x04   # host unreachable (incl. DNS failures)
+            elif isinstance(e, ConnectionRefusedError):
+                rep = 0x05   # connection refused
+            else:
+                rep = 0x01   # general failure
+            # Log the failure (the launcher sends stderr to the log file)
+            print('CONNECT %s:%d failed: %s' % (addr, port, e), file=sys.stderr)
+            client_socket.sendall(
+                b'\x05' + bytes([rep]) + b'\x00\x01' +
+                b'\x00\x00\x00\x00\x00\x00')
             client_socket.close()
             return
 
@@ -905,6 +996,12 @@ def handle_client(client_socket):
             peer = '?'
         counters = {'up': 0, 'down': 0}
         done = threading.Event()
+        # `last` is bumped whenever either direction moves data; `left`
+        # counts the directions still running. The sockets are only closed
+        # once BOTH have stopped, so a half-closed peer (a client that
+        # finished sending but is still reading, e.g. a download) keeps
+        # receiving in-flight replies.
+        state = {'last': time.time(), 'left': 2}
         client_socket.settimeout(1)
         target_socket.settimeout(1)
 
@@ -916,20 +1013,35 @@ def handle_client(client_socket):
                         data = src.recv(BUFFER_SIZE)
                     except socket.timeout:
                         if done.is_set():
-                            break   # the other direction already ended
+                            break   # the tunnel is being torn down
+                        if time.time() - state['last'] > IDLE_TIMEOUT:
+                            done.set()   # idle too long — wind everything down
+                            break
                         continue
                     if not data:
-                        break   # remote side closed the connection
+                        # Source closed: half-close the destination so it sees
+                        # FIN and can finish sending in-flight data. The other
+                        # direction keeps running until IT also ends (or the
+                        # idle timeout fires), so no bytes are dropped.
+                        try:
+                            dst.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        break
                     dst.sendall(data)   # sendall: never silently truncates
                     with _stats_lock:
+                        state['last'] = time.time()
                         counters[direction] += len(data)
-            except:
-                pass            # connection reset / timeout — stop copying
+            except OSError:
+                pass            # connection reset / closed — stop copying
             finally:
-                done.set()      # this direction is finished
-                # Close both sockets to tear down the tunnel
-                src.close()
-                dst.close()
+                # Close both sockets only when this was the last direction
+                with _stats_lock:
+                    state['left'] -= 1
+                    if state['left'] == 0:
+                        done.set()
+                        src.close()
+                        dst.close()
 
         up_thread = threading.Thread(
             target=forward, args=(client_socket, target_socket, 'up'),
@@ -950,7 +1062,8 @@ def handle_client(client_socket):
                     int(time.time() - started)))
 
     except Exception as e:
-        pass   # any unexpected error: just drop this client
+        # Log unexpected failures so the launcher's `logs` command shows them
+        print('Error handling client: %s' % e, file=sys.stderr)
     finally:
         # Decrement the live-connection counter (protected by the stats lock)
         with _stats_lock:
@@ -995,10 +1108,24 @@ def main():
     while True:
         client, addr = server.accept()
         tune_socket(client)   # apply latency + buffer tuning to the peer
-        print(f"Connection from {addr[0]}:{addr[1]}")
+        # Enforce the connection cap before spawning a thread, so a flood of
+        # new connections can't exhaust threads or memory
         with _stats_lock:
-            _active_conns += 1
-            _total_conns += 1
+            if _active_conns >= MAX_CONNS:
+                over = True
+            else:
+                over = False
+                _active_conns += 1
+                _total_conns += 1
+        if over:
+            try:
+                client.close()
+            except OSError:
+                pass
+            print('Rejected connection from %s:%d (limit %d reached)'
+                  % (addr[0], addr[1], MAX_CONNS), file=sys.stderr)
+            continue
+        print(f"Connection from {addr[0]}:{addr[1]}")
         threading.Thread(target=handle_client, args=(client,), daemon=True).start()
 
 
@@ -1015,10 +1142,18 @@ EOL
     AUTH_PASS=$(get_stored_pass)
 
     # Output goes to a log file (view it with `socks5-proxy logs`) and live
+    # Pass the tuning limits to the server; it has built-in defaults and they
+    # are only overridden when the user saved a value in the config file
+    IDLE_TIMEOUT_VAL=$(get_stored_idle)
+    MAX_CONNS_VAL=$(get_stored_maxconns)
+    [[ "$IDLE_TIMEOUT_VAL" =~ ^[0-9]+$ ]] || IDLE_TIMEOUT_VAL=600
+    [[ "$MAX_CONNS_VAL" =~ ^[0-9]+$ ]] || MAX_CONNS_VAL=256
+
     # stats are written for the `status` command. Credentials stay in env vars.
     # -u keeps the log output unbuffered so `socks5-proxy logs` sees it live
     if command -v setsid >/dev/null 2>&1; then
         SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" \
+            SOCKS5_IDLE_TIMEOUT="$IDLE_TIMEOUT_VAL" SOCKS5_MAX_CONNS="$MAX_CONNS_VAL" \
             setsid nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
             > "$CONFIG_DIR/proxy.log" 2>&1 &
     else
@@ -1026,6 +1161,7 @@ EOL
         # kill it too — warn the user instead of silently claiming it's safe
         echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
         SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" \
+            SOCKS5_IDLE_TIMEOUT="$IDLE_TIMEOUT_VAL" SOCKS5_MAX_CONNS="$MAX_CONNS_VAL" \
             nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
             > "$CONFIG_DIR/proxy.log" 2>&1 &
     fi
@@ -1087,9 +1223,14 @@ echo -e "   Uninstall:   ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-pro
 echo -e ""
 echo -e "${YELLOW}Press Ctrl+C to exit (proxy stays running)${NC}"
 
-# 10) Keep the script alive so the user can read the output;
-#     `wait` blocks until the background proxy is killed.
+# 10) Keep the script alive so the user can read the output; `wait` blocks
+#     until the background proxy is killed. Only do this in an interactive
+#     terminal — when stdin is not a TTY (scripts, e2e tests, cron) the
+#     launcher returns immediately and the proxy keeps running in the
+#     background, so `start`/`restart`/`reset` never hang a script.
+if [ -t 0 ]; then
     wait
+fi
 }
 
 # ----------------------------------------------------------------------------
@@ -1245,6 +1386,39 @@ set_ip() {
 }
 
 # ----------------------------------------------------------------------------
+# set_idle — save the idle timeout in seconds
+#   Args: $1 = seconds (10 or more)
+# ----------------------------------------------------------------------------
+set_idle() {
+    if ! [[ "${1:-}" =~ ^[0-9]+$ ]] || [ "${1:-}" -lt 10 ]; then
+        echo -e "${RED}❌ Invalid idle timeout: '${1:-}' (must be a number of 10 or more seconds)${NC}"
+        exit 1
+    fi
+    save_config "IDLE_TIMEOUT" "$1"
+    echo -e "${GREEN}✅ Idle timeout set to $1 seconds.${NC}"
+    echo -e "${YELLOW}ℹ️  Connections with no traffic for that long will be closed.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# set_maxconns — save the maximum simultaneous connections
+#   Args: $1 = connection count (1-65535)
+# ----------------------------------------------------------------------------
+set_maxconns() {
+    if ! [[ "${1:-}" =~ ^[0-9]+$ ]] || [ "${1:-}" -lt 1 ] || [ "${1:-}" -gt 65535 ]; then
+        echo -e "${RED}❌ Invalid connection limit: '${1:-}' (must be a number from 1 to 65535)${NC}"
+        exit 1
+    fi
+    save_config "MAX_CONNS" "$1"
+    echo -e "${GREEN}✅ Max connections set to $1.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # set_auth — enable username/password authentication (RFC 1929)
 #   Args: $1 = username, $2 = password (optional — prompted hidden if omitted,
 #         so the password never appears in `ps` output or shell history)
@@ -1290,6 +1464,7 @@ unset_auth() {
 # ----------------------------------------------------------------------------
 show_config() {
     local user=$(get_stored_user)
+    local idle=$(get_stored_idle) maxconns=$(get_stored_maxconns)
     echo -e "${YELLOW}📁 Saved configuration:${NC}"
     echo -e "   Port: ${GREEN}$(get_stored_port)${NC}"
     echo -e "   IP:   ${GREEN}$(get_stored_ip)${NC}"
@@ -1298,6 +1473,7 @@ show_config() {
     else
         echo -e "   Auth: ${YELLOW}off${NC}"
     fi
+    echo -e "   Idle timeout: ${GREEN}${idle:-600}s${NC}   Max conns: ${GREEN}${maxconns:-256}${NC}"
 }
 
 # =============================================================================
@@ -1313,6 +1489,20 @@ case "$CMD" in
     stop)
         stop_proxy
         ;;
+    restart)
+        stop_proxy -q
+        start_proxy "$2"
+        ;;
+    reset)
+        # Restart with fresh traffic counters (they live in the server's
+        # memory, so a restart is what actually zeroes them). The message is
+        # printed before start_proxy, whose interactive `wait` would otherwise
+        # delay it until Ctrl+C.
+        stop_proxy -q
+        rm -f "$CONFIG_DIR/conns" "$CONFIG_DIR/stats"
+        echo -e "${YELLOW}ℹ️  Traffic counters cleared.${NC}"
+        start_proxy "$2"
+        ;;
     status)
         show_status
         ;;
@@ -1324,22 +1514,41 @@ case "$CMD" in
         ;;
     set)
         case "${2:-}" in
-            port) set_port "${3:-}" ;;
-            ip)   set_ip "${3:-}" ;;
-            auth) set_auth "${3:-}" "${4:-}" ;;
+            port)    set_port "${3:-}" ;;
+            ip)      set_ip "${3:-}" ;;
+            auth)    set_auth "${3:-}" "${4:-}" ;;
+            idle)    set_idle "${3:-}" ;;
+            maxconns) set_maxconns "${3:-}" ;;
             *)
-                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>|auth <user> <pass>}${NC}"
+                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>|auth <user> <pass>|idle <secs>|maxconns <n>}${NC}"
                 exit 1
                 ;;
         esac
         ;;
     unset)
-        if [ "${2:-}" = "auth" ]; then
-            unset_auth
-        else
-            echo -e "${RED}❌ Usage: socks5-proxy unset auth${NC}"
-            exit 1
-        fi
+        case "${2:-}" in
+            auth)
+                unset_auth
+                ;;
+            idle)
+                remove_config "IDLE_TIMEOUT"
+                echo -e "${GREEN}✅ Idle timeout reset to the default (600s).${NC}"
+                if is_running; then
+                    echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
+                fi
+                ;;
+            maxconns)
+                remove_config "MAX_CONNS"
+                echo -e "${GREEN}✅ Max connections reset to the default (256).${NC}"
+                if is_running; then
+                    echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
+                fi
+                ;;
+            *)
+                echo -e "${RED}❌ Usage: socks5-proxy unset {auth|idle|maxconns}${NC}"
+                exit 1
+                ;;
+        esac
         ;;
     show)
         if [ "${2:-}" = "config" ]; then
