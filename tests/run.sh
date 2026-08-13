@@ -807,6 +807,14 @@ chk "unset idle restores default" \
     'bash "$SCRIPT" unset idle >/dev/null 2>&1 && ! grep -q "^IDLE_TIMEOUT=" "$CONFIG_FILE"'
 chk "unset maxconns restores default" \
     'bash "$SCRIPT" unset maxconns >/dev/null 2>&1 && ! grep -q "^MAX_CONNS=" "$CONFIG_FILE"'
+chk "set loglevel saves config" \
+    'bash "$SCRIPT" set loglevel info >/dev/null 2>&1 && grep -q "^LOG_LEVEL=info$" "$CONFIG_FILE"'
+chk "set loglevel rejects invalid" \
+    '! bash "$SCRIPT" set loglevel verbose >/dev/null 2>&1'
+chk "show config prints log level" \
+    'bash "$SCRIPT" show config | strip_colors | grep -q "Log level: info"'
+chk "unset loglevel restores default" \
+    'bash "$SCRIPT" unset loglevel >/dev/null 2>&1 && ! grep -q "^LOG_LEVEL=" "$CONFIG_FILE"'
 # status --watch must not hang when stdout is not a terminal: it prints a
 # single snapshot and returns (the loop only runs on a real terminal)
 chk "status -w prints a snapshot when not a terminal" \
@@ -970,6 +978,89 @@ chk "e2e: status shows stopped" \
 chk "e2e: port released" \
     '! python3 -c "import socket; s=socket.create_connection((\"127.0.0.1\",19310),timeout=2); s.close()" 2>/dev/null'
 chk "e2e: no leftover proxy" \
+    '[ "$(ps aux | grep -c "[s]ocks5_server")" = "0" ]'
+
+# --- log level end-to-end ---------------------------------------------------
+# Default is warning: the startup banner is always shown, but the per-
+# connection "Connection from ..." lines are info-only and must be hidden.
+printf 'PROXY_PORT=19311\nPROXY_IP=127.0.0.1\n' > "$CONFIG_FILE"
+( bash "$SCRIPT" start >/dev/null 2>&1 & )
+sleep 3
+python3 - <<'PYEOF'
+import socket, struct, threading
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(1)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def loop():
+    try:
+        c, _ = sink.accept()
+        echo(c)
+    except OSError:
+        pass
+threading.Thread(target=loop, daemon=True).start()
+s = socket.create_connection(('127.0.0.1', 19311), timeout=5)
+s.sendall(b'\x05\x01\x00'); assert s.recv(2) == b'\x05\x00'
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+s.sendall(b'loglvl'); assert s.recv(6) == b'loglvl'
+s.close(); sink.close()
+import time; time.sleep(2)
+PYEOF
+chk "loglevel e2e: default (warning) hides connection lines" \
+    '! grep -q "Connection from" "$CONFIG_DIR/proxy.log"'
+chk "loglevel e2e: startup banner always present" \
+    'grep -q "SOCKS5 proxy running" "$CONFIG_DIR/proxy.log"'
+# switching to info makes the per-connection lines appear after a restart.
+# The log is cleared first so the info-level checks only see fresh output.
+bash "$SCRIPT" set loglevel info >/dev/null 2>&1
+: > "$CONFIG_DIR/proxy.log"
+bash "$SCRIPT" restart >/dev/null 2>&1
+sleep 3
+python3 - <<'PYEOF'
+import socket, struct, threading
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(1)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def loop():
+    try:
+        c, _ = sink.accept()
+        echo(c)
+    except OSError:
+        pass
+threading.Thread(target=loop, daemon=True).start()
+s = socket.create_connection(('127.0.0.1', 19311), timeout=5)
+s.sendall(b'\x05\x01\x00'); assert s.recv(2) == b'\x05\x00'
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+s.sendall(b'loglvl'); assert s.recv(6) == b'loglvl'
+s.close(); sink.close()
+# a refused target still logs a warning at info level
+r = socket.create_connection(('127.0.0.1', 19311), timeout=5)
+r.sendall(b'\x05\x01\x00'); assert r.recv(2) == b'\x05\x00'
+r.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', 1))
+assert r.recv(10)[1] == 0x05
+r.close()
+import time; time.sleep(2)
+PYEOF
+chk "loglevel e2e: info shows connection lines" \
+    'grep -q "Connection from" "$CONFIG_DIR/proxy.log"'
+chk "loglevel e2e: warning still logged at info level" \
+    'grep -q "CONNECT 127.0.0.1:1 failed" "$CONFIG_DIR/proxy.log"'
+bash "$SCRIPT" stop >/dev/null 2>&1
+sleep 1
+chk "loglevel e2e: stopped cleanly" \
     '[ "$(ps aux | grep -c "[s]ocks5_server")" = "0" ]'
 rm -rf "$PREFIX"
 
