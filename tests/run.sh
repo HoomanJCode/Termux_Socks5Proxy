@@ -813,6 +813,42 @@ s, r = handshake(srv_port, b'\x00\x02')      # auth off
 chk("auth off -> no-auth method 0x00", r == b'\x05\x00')
 s.close()
 
+# --- debug log level: connection lifecycle details -------------------------
+dbg_port = 19307
+env_dbg = dict(os.environ, SOCKS5_LOG_LEVEL='debug', SOCKS5_IDLE_TIMEOUT='3')
+pd = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                       str(dbg_port), '127.0.0.1'], env=env_dbg,
+                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+time.sleep(1)
+chk("debug proxy starts", pd.poll() is None)
+# a sink that accepts but never sends, so the 3s idle timeout must kill the
+# tunnel — the debug log has to say so (up=idle/down=idle)
+silent = socket.socket(); silent.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+silent.bind(('127.0.0.1', 0)); silent.listen(1)
+silent_port = silent.getsockname()[1]
+def hold(c):
+    time.sleep(6)
+    c.close()
+def hold_loop():
+    try:
+        c, _ = silent.accept()
+        threading.Thread(target=hold, args=(c,), daemon=True).start()
+    except OSError:
+        pass
+threading.Thread(target=hold_loop, daemon=True).start()
+s, _ = handshake(dbg_port)
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1')
+          + struct.pack('>H', silent_port))
+chk("debug CONNECT ok", s.recv(10)[1] == 0x00)
+time.sleep(6)   # give the 3s idle timeout time to tear the tunnel down
+s.close(); silent.close()
+pd.terminate(); pd.wait()   # stop it first — reading the pipe needs EOF
+err = pd.stdout.read().decode('utf-8', 'replace')
+chk("debug logs tunnel established", 'tunnel' in err and 'established' in err)
+chk("debug logs tunnel closed with reasons", 'closed: up=' in err)
+chk("debug shows the idle teardown", 'up=idle' in err or 'down=idle' in err)
+
+
 p.terminate(); p.wait(); pa.terminate(); pa.wait()
 ts.close(); us.close()
 if v6sink: v6sink.close()
