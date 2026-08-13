@@ -111,7 +111,8 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 | `socks5-proxy reset` | Restart with fresh traffic counters (clears stats + conns) |
 | `socks5-proxy status` | Show running state + saved settings + live stats (bytes, recent connections) |
 | `socks5-proxy status -w [secs]` | Live-updating status, redrawn every N seconds (default 2) — Ctrl+C to stop |
-| `socks5-proxy logs` | Show the proxy log (follows live while running) |
+| `socks5-proxy logs` | Show the proxy log (follows live while running); colorized when on a terminal |
+| `socks5-proxy logs --color` | Force colored log lines (errors red, warnings yellow, connections cyan, banner green) |
 | `socks5-proxy set port 1080` | Save the listening port |
 | `socks5-proxy set ip 192.168.1.10` | Save the listening IP (`0.0.0.0` = all IPv4 interfaces, `::` = all IPv4 + IPv6) |
 | `socks5-proxy set auth myuser` | Enable auth — you'll be prompted for the password (hidden) |
