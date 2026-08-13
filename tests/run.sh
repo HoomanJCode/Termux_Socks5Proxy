@@ -1031,6 +1031,57 @@ chk("stab: 6 concurrent conns persist and echo own payload", all_ok)
 for c, _ in conns:
     c.close()
 
+# --- H: slow reader must not kill the sender (relay send timeout regression)
+# A peer that drains its window slowly (here ~40KB/s, so a 64KiB relay write
+# takes >1s) used to make the relay's sendall hit the 1s socket timeout and
+# die mid-upload, truncating large requests. The relay must retry instead.
+slow = socket.socket(); slow.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+slow.bind(('127.0.0.1', 0)); slow.listen(4)
+sport = slow.getsockname()[1]
+def slow_echo():
+    c, _ = slow.accept()
+    try:
+        # Tiny receive window + a 3s pause before reading: the relay's first
+        # send fills the window and must block well past the 1s socket
+        # timeout. That used to kill the upload direction outright.
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    except OSError:
+        pass
+    time.sleep(3)
+    try:
+        while True:
+            d = c.recv(4096)
+            if not d:
+                break
+            time.sleep(0.1)          # drain at ~40KB/s — stalls relay sends
+            c.sendall(d)
+    except OSError:
+        pass
+    try: c.close()
+    except OSError: pass
+threading.Thread(target=slow_echo, daemon=True).start()
+
+s = socket.create_connection(('127.0.0.1', 19370), timeout=5)
+s.sendall(b'\x05\x01\x00')
+assert s.recv(2) == b'\x05\x00'
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', sport))
+assert s.recv(10)[1] == 0x00
+payload = os.urandom(128 * 1024)
+s.sendall(payload)
+s.settimeout(20)
+got = b''
+try:
+    while len(got) < len(payload):
+        d = s.recv(65536)
+        if not d:
+            break
+        got += d
+except (socket.timeout, ConnectionResetError, OSError):
+    pass
+chk("stab: 128KiB upload survives a slow reader (no send-timeout kill)", got == payload)
+s.close()
+slow.close()
+
 p.terminate(); p.wait(); sink.close()
 print("RESULT: %d passed, %d failed" % (pass_, fail))
 sys.exit(1 if fail else 0)
