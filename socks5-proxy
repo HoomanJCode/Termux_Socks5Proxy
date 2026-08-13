@@ -119,6 +119,17 @@ get_stored_maxconns() {
 }
 
 # ----------------------------------------------------------------------------
+# get_stored_loglevel — read the saved log verbosity (debug/info/warning/error)
+# ----------------------------------------------------------------------------
+get_stored_loglevel() {
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -n 's/^LOG_LEVEL=//p' "$CONFIG_FILE" | tr -d '\r' | head -1
+    else
+        echo ""   # no config file yet -> default (warning) is used
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # remove_config — delete a key=value line from the config file
 #   Args: $1 = key to remove
 # ----------------------------------------------------------------------------
@@ -321,8 +332,10 @@ ${GREEN}COMMANDS${NC}
     set idle <secs>      Save the idle timeout: connections with no traffic
                          are closed after this long (default 600s)
     set maxconns <n>     Save the max simultaneous connections (default 256)
+    set loglevel <lvl>   Log verbosity: debug, info, warning, error (default warning)
     unset auth           Disable authentication
     unset idle|maxconns  Restore the defaults for the limit above
+    unset loglevel       Restore the default log level (warning)
     show config          Show the saved port, IP, and auth state
     help                 Show this help
     --version            Show the version
@@ -340,6 +353,7 @@ ${GREEN}EXAMPLES${NC}
     socks5-proxy set ip ::        Listen on all interfaces (IPv4 + IPv6)
     socks5-proxy set idle 900     Close connections idle for 15 minutes
     socks5-proxy set maxconns 64  Allow at most 64 simultaneous connections
+    socks5-proxy set loglevel info   Log every connection (default: warning)
     socks5-proxy restart          Apply saved changes without stopping first
     socks5-proxy reset            Restart with fresh traffic counters
     socks5-proxy status           Check whether the proxy is running
@@ -355,7 +369,7 @@ ${GREEN}FIRST RUN${NC}
 
 ${GREEN}FILES${NC}
     $CONFIG_DIR/config      saved settings: PROXY_PORT, PROXY_IP, PROXY_USER/PASS,
-                            IDLE_TIMEOUT, MAX_CONNS
+                            IDLE_TIMEOUT, MAX_CONNS, LOG_LEVEL
     $CONFIG_DIR/pid         PID of the running proxy
     $CONFIG_DIR/proxy.log   proxy output (view with \`logs\`; rotated to
                             proxy.log.1 when larger than 1 MiB)
@@ -499,6 +513,19 @@ IDLE_TIMEOUT = _env_int('SOCKS5_IDLE_TIMEOUT', '600')
 # handshake, protecting threads and memory from connection floods.
 # Configurable via SOCKS5_MAX_CONNS.
 MAX_CONNS = _env_int('SOCKS5_MAX_CONNS', '256')
+# Log verbosity: debug < info < warning < error (default: warning). The
+# launcher passes it from the LOG_LEVEL config key as SOCKS5_LOG_LEVEL.
+# An unknown value falls back to warning so a hand-edited config can't
+# crash the server or silence its errors.
+LOG_LEVEL = os.environ.get('SOCKS5_LOG_LEVEL', 'warning').strip().lower()
+_LOG_RANKS = {'debug': 10, 'info': 20, 'warning': 30, 'error': 40}
+LOG_LEVEL_RANK = _LOG_RANKS.get(LOG_LEVEL, 30)
+
+
+def log(level, msg, stream=sys.stdout):
+    """Emit `msg` when `level` is at or above the configured log level."""
+    if _LOG_RANKS.get(level, 30) >= LOG_LEVEL_RANK:
+        print(msg, file=stream, flush=True)
 
 # Optional RFC 1929 username/password authentication. Disabled by default:
 # it only kicks in when SOCKS5_USER is set (the launcher provides it).
@@ -970,7 +997,7 @@ def handle_client(client_socket):
             else:
                 rep = 0x01   # general failure
             # Log the failure (the launcher sends stderr to the log file)
-            print('CONNECT %s:%d failed: %s' % (addr, port, e), file=sys.stderr)
+            log('warning', 'CONNECT %s:%d failed: %s' % (addr, port, e), stream=sys.stderr)
             client_socket.sendall(
                 b'\x05' + bytes([rep]) + b'\x00\x01' +
                 b'\x00\x00\x00\x00\x00\x00')
@@ -1066,7 +1093,7 @@ def handle_client(client_socket):
 
     except Exception as e:
         # Log unexpected failures so the launcher's `logs` command shows them
-        print('Error handling client: %s' % e, file=sys.stderr)
+        log('error', 'Error handling client: %s' % e, stream=sys.stderr)
     finally:
         # Decrement the live-connection counter (protected by the stats lock)
         with _stats_lock:
@@ -1098,8 +1125,10 @@ def main():
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_sock.bind((BIND_IP, PORT))
 
-    print(f"SOCKS5 proxy running on {BIND_IP}:{PORT}")
-    print("Ready for connections...")
+    # The startup banner is always shown (even at the default warning level)
+    # so `socks5-proxy logs` always confirms the proxy is serving
+    print(f"SOCKS5 proxy running on {BIND_IP}:{PORT}", flush=True)
+    print("Ready for connections...", flush=True)
 
     # Keep the launcher's `status` command up to date with live stats
     threading.Thread(target=stats_writer, daemon=True).start()
@@ -1125,10 +1154,10 @@ def main():
                 client.close()
             except OSError:
                 pass
-            print('Rejected connection from %s:%d (limit %d reached)'
-                  % (addr[0], addr[1], MAX_CONNS), file=sys.stderr)
+            log('warning', 'Rejected connection from %s:%d (limit %d reached)'
+                % (addr[0], addr[1], MAX_CONNS), stream=sys.stderr)
             continue
-        print(f"Connection from {addr[0]}:{addr[1]}")
+        log('info', f"Connection from {addr[0]}:{addr[1]}")
         threading.Thread(target=handle_client, args=(client,), daemon=True).start()
 
 
@@ -1151,12 +1180,18 @@ EOL
     MAX_CONNS_VAL=$(get_stored_maxconns)
     [[ "$IDLE_TIMEOUT_VAL" =~ ^[0-9]+$ ]] || IDLE_TIMEOUT_VAL=600
     [[ "$MAX_CONNS_VAL" =~ ^[0-9]+$ ]] || MAX_CONNS_VAL=256
+    LOG_LEVEL_VAL=$(get_stored_loglevel)
+    case "$LOG_LEVEL_VAL" in
+        debug|info|warning|error) ;;
+        *) LOG_LEVEL_VAL=warning ;;
+    esac
 
     # stats are written for the `status` command. Credentials stay in env vars.
     # -u keeps the log output unbuffered so `socks5-proxy logs` sees it live
     if command -v setsid >/dev/null 2>&1; then
         SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" \
             SOCKS5_IDLE_TIMEOUT="$IDLE_TIMEOUT_VAL" SOCKS5_MAX_CONNS="$MAX_CONNS_VAL" \
+            SOCKS5_LOG_LEVEL="$LOG_LEVEL_VAL" \
             setsid nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
             > "$CONFIG_DIR/proxy.log" 2>&1 &
     else
@@ -1165,6 +1200,7 @@ EOL
         echo -e "${YELLOW}⚠️  setsid not found — the proxy may be stopped by Ctrl+C${NC}"
         SOCKS5_USER="$AUTH_USER" SOCKS5_PASS="$AUTH_PASS" SOCKS5_STATS="$CONFIG_DIR/stats" SOCKS5_CONNS="$CONFIG_DIR/conns" \
             SOCKS5_IDLE_TIMEOUT="$IDLE_TIMEOUT_VAL" SOCKS5_MAX_CONNS="$MAX_CONNS_VAL" \
+            SOCKS5_LOG_LEVEL="$LOG_LEVEL_VAL" \
             nohup python -u "$CONFIG_DIR/socks5_server.py" "$PORT" "$BIND_IP" \
             > "$CONFIG_DIR/proxy.log" 2>&1 &
     fi
@@ -1451,6 +1487,25 @@ set_maxconns() {
 }
 
 # ----------------------------------------------------------------------------
+# set_loglevel — save the log verbosity
+#   Args: $1 = one of debug, info, warning, error
+# ----------------------------------------------------------------------------
+set_loglevel() {
+    case "${1:-}" in
+        debug|info|warning|error) ;;
+        *)
+            echo -e "${RED}❌ Invalid log level: '${1:-}' (use debug, info, warning, or error)${NC}"
+            exit 1
+            ;;
+    esac
+    save_config "LOG_LEVEL" "$1"
+    echo -e "${GREEN}✅ Log level set to $1.${NC}"
+    if is_running; then
+        echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # set_auth — enable username/password authentication (RFC 1929)
 #   Args: $1 = username, $2 = password (optional — prompted hidden if omitted,
 #         so the password never appears in `ps` output or shell history)
@@ -1496,7 +1551,7 @@ unset_auth() {
 # ----------------------------------------------------------------------------
 show_config() {
     local user=$(get_stored_user)
-    local idle=$(get_stored_idle) maxconns=$(get_stored_maxconns)
+    local idle=$(get_stored_idle) maxconns=$(get_stored_maxconns) loglevel=$(get_stored_loglevel)
     echo -e "${YELLOW}📁 Saved configuration:${NC}"
     echo -e "   Port: ${GREEN}$(get_stored_port)${NC}"
     echo -e "   IP:   ${GREEN}$(get_stored_ip)${NC}"
@@ -1506,6 +1561,7 @@ show_config() {
         echo -e "   Auth: ${YELLOW}off${NC}"
     fi
     echo -e "   Idle timeout: ${GREEN}${idle:-600}s${NC}   Max conns: ${GREEN}${maxconns:-256}${NC}"
+    echo -e "   Log level: ${GREEN}${loglevel:-warning}${NC}"
 }
 
 # =============================================================================
@@ -1558,8 +1614,9 @@ case "$CMD" in
             auth)    set_auth "${3:-}" "${4:-}" ;;
             idle)    set_idle "${3:-}" ;;
             maxconns) set_maxconns "${3:-}" ;;
+            loglevel) set_loglevel "${3:-}" ;;
             *)
-                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>|auth <user> <pass>|idle <secs>|maxconns <n>}${NC}"
+                echo -e "${RED}❌ Usage: socks5-proxy set {port <1-65535>|ip <IP>|auth <user> <pass>|idle <secs>|maxconns <n>|loglevel <debug|info|warning|error>}${NC}"
                 exit 1
                 ;;
         esac
@@ -1583,8 +1640,15 @@ case "$CMD" in
                     echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
                 fi
                 ;;
+            loglevel)
+                remove_config "LOG_LEVEL"
+                echo -e "${GREEN}✅ Log level reset to the default (warning).${NC}"
+                if is_running; then
+                    echo -e "${YELLOW}ℹ️  Proxy is running — restart to apply (socks5-proxy restart).${NC}"
+                fi
+                ;;
             *)
-                echo -e "${RED}❌ Usage: socks5-proxy unset {auth|idle|maxconns}${NC}"
+                echo -e "${RED}❌ Usage: socks5-proxy unset {auth|idle|maxconns|loglevel}${NC}"
                 exit 1
                 ;;
         esac
