@@ -23,6 +23,7 @@ GREEN=$'\033[0;32m'   # green  — success messages / values
 YELLOW=$'\033[1;33m'  # yellow — informational text
 RED=$'\033[0;31m'     # red    — errors
 BLUE=$'\033[0;34m'    # blue   — hints / examples
+CYAN=$'\033[0;36m'    # cyan   — informational log lines (connections)
 NC=$'\033[0m'         # no color — resets formatting back to default
 
 # Current version of this tool (shown by `socks5-proxy --version`)
@@ -323,7 +324,8 @@ ${GREEN}COMMANDS${NC}
     reset                Restart and clear traffic counters (stats + conns)
     status               Show running state + saved settings + live stats
     status -w [secs]     Live status, re-drawn every N seconds (default 2)
-    logs                 Show the proxy log (follows when running)
+    logs [-c|--color]    Show the proxy log (follows when running);
+                         colorized in a terminal, --color forces it
     set port <1-65535>   Save the listening port
     set ip <IP>          Save the listening IP (IPv4 or IPv6 literal)
                          0.0.0.0 / :: = all interfaces
@@ -360,6 +362,7 @@ ${GREEN}EXAMPLES${NC}
     socks5-proxy status -w        Watch traffic live (refresh every 2s)
     socks5-proxy status -w 1      Watch with a 1-second refresh
     socks5-proxy logs             Watch live connections
+    socks5-proxy logs --color     Same, with colored log lines
     socks5-proxy stop             Stop the running proxy
 
 ${GREEN}FIRST RUN${NC}
@@ -1403,21 +1406,68 @@ show_status_watch() {
 }
 
 # ----------------------------------------------------------------------------
+# colorize_log — color proxy log lines by their level (reads stdin)
+#   banner -> green, connections -> cyan, warnings -> yellow, errors -> red;
+#   anything else is passed through untouched so piping stays clean
+# ----------------------------------------------------------------------------
+colorize_log() {
+    local line level
+    while IFS= read -r line; do
+        case "$line" in
+            *"Error handling client"*)   level="$RED" ;;
+            *"CONNECT "*)                level="$YELLOW" ;;
+            *"Rejected connection"*)     level="$YELLOW" ;;
+            *"Connection from"*)         level="$CYAN" ;;
+            *"SOCKS5 proxy running"*|*"Ready for connections"*) level="$GREEN" ;;
+            *)                           level="" ;;
+        esac
+        if [ -n "$level" ]; then
+            echo -e "${level}${line}${NC}"
+        else
+            echo "$line"
+        fi
+    done
+}
+
+# ----------------------------------------------------------------------------
 # show_logs — show the proxy's log output
-#   Follows live (tail -f) when running; shows the last lines otherwise
+#   Follows live (tail -f) when running; shows the last lines otherwise.
+#   Colors are applied automatically when stdout is a terminal; use --color
+#   (or -c) to force color even when piped, and --plain (or -p) to disable it.
 # ----------------------------------------------------------------------------
 show_logs() {
-    local logfile="$CONFIG_DIR/proxy.log"
+    local logfile="$CONFIG_DIR/proxy.log" color=auto
+    case "${1:-}" in
+        -c|--color) color=on ;;
+        -p|--plain) color=off ;;
+        "") ;;
+        *)
+            echo -e "${RED}❌ Usage: socks5-proxy logs [-c|--color] [-p|--plain]${NC}"
+            return 1
+            ;;
+    esac
+    local use_color=0
+    if [ "$color" = on ] || { [ "$color" = auto ] && [ -t 1 ]; }; then
+        use_color=1
+    fi
     if [ ! -f "$logfile" ]; then
         echo -e "${YELLOW}ℹ️  No log file yet — start the proxy first.${NC}"
         return 0
     fi
     if is_running; then
         echo -e "${GREEN}📜 Proxy log (Ctrl+C to stop following):${NC}"
-        tail -n 30 -f "$logfile"
+        if [ "$use_color" = 1 ]; then
+            tail -n 30 -f "$logfile" | colorize_log
+        else
+            tail -n 30 -f "$logfile"
+        fi
     else
         echo -e "${YELLOW}ℹ️  Proxy is not running — showing the last lines:${NC}"
-        tail -n 30 "$logfile"
+        if [ "$use_color" = 1 ]; then
+            tail -n 30 "$logfile" | colorize_log
+        else
+            tail -n 30 "$logfile"
+        fi
     fi
 }
 
@@ -1602,7 +1652,7 @@ case "$CMD" in
         esac
         ;;
     logs)
-        show_logs
+        show_logs "$2"
         ;;
     version|-V|--version)
         echo -e "socks5-proxy ${GREEN}v$VERSION${NC}"
