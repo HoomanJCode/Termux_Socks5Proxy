@@ -946,13 +946,25 @@ chk "install: copy is byte-identical" \
     'cmp -s "$SCRIPT" "$INSTALL_DIR/bin/socks5-proxy"'
 chk "install: installed script runs" \
     'PREFIX="$INSTALL_DIR" bash "$INSTALL_DIR/bin/socks5-proxy" --version | grep -q "v[0-9]"'
-chk "install: re-install is an update, still works" \
-    'bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" >/dev/null 2>&1 && cmp -s "$SCRIPT" "$INSTALL_DIR/bin/socks5-proxy"'
+# Re-installing the SAME version is a no-op ("already installed")
+chk "install: same version reports already installed" \
+    'out=$(bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" 2>&1); echo "$out" | grep -q "already installed" && cmp -s "$SCRIPT" "$INSTALL_DIR/bin/socks5-proxy"'
+# A NEWER source version must be picked up as an update
+mkdir -p "$TMP/v2"
+cp "$SCRIPT" "$TMP/v2/socks5-proxy"
+cp "$ROOT/install.sh" "$TMP/v2/install.sh"
+sed -i 's/^VERSION="[^"]*"/VERSION="9.9.9"/' "$TMP/v2/socks5-proxy"
+chk "install: version bump updates the installed copy" \
+    'bash "$TMP/v2/install.sh" --prefix "$INSTALL_DIR" > "$TMP/install-out.txt" 2>&1 && PREFIX="$INSTALL_DIR" bash "$INSTALL_DIR/bin/socks5-proxy" --version | grep -q "v9.9.9"'
+chk "install: update message shows the version change" \
+    'grep -q "Updated" "$TMP/install-out.txt" && grep -q "v9.9.9" "$TMP/install-out.txt"'
+chk "install: --no-restart is accepted" \
+    'bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" --no-restart >/dev/null 2>&1'
 chk "install: --uninstall removes it" \
     'bash "$ROOT/install.sh" --prefix "$INSTALL_DIR" --uninstall >/dev/null 2>&1 && [ ! -f "$INSTALL_DIR/bin/socks5-proxy" ]'
 chk "install: unknown option rejected" \
     '! bash "$ROOT/install.sh" --bogus >/dev/null 2>&1'
-rm -rf "$INSTALL_DIR"
+rm -rf "$INSTALL_DIR" "$TMP/v2" "$TMP/install-out.txt"
 
 # ---------------------------------------------------------------------------
 echo
