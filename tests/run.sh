@@ -807,6 +807,12 @@ chk "unset idle restores default" \
     'bash "$SCRIPT" unset idle >/dev/null 2>&1 && ! grep -q "^IDLE_TIMEOUT=" "$CONFIG_FILE"'
 chk "unset maxconns restores default" \
     'bash "$SCRIPT" unset maxconns >/dev/null 2>&1 && ! grep -q "^MAX_CONNS=" "$CONFIG_FILE"'
+# status --watch must not hang when stdout is not a terminal: it prints a
+# single snapshot and returns (the loop only runs on a real terminal)
+chk "status -w prints a snapshot when not a terminal" \
+    'bash "$SCRIPT" status -w < /dev/null | grep -q "SOCKS5 Proxy Status"'
+chk "status -w rejects a bad interval" \
+    '! bash "$SCRIPT" status -w 0 >/dev/null 2>&1 && ! bash "$SCRIPT" status -w abc >/dev/null 2>&1'
 
 # the one computed inside format_uptime (90s -> "1m 30s" or "1m 31s").
 chk "format_uptime seconds"    '[[ "$(format_uptime $(date +%s))" =~ ^(0s|1s)$ ]]'
@@ -899,6 +905,36 @@ chk "e2e: conns file written" \
     '[ -f "$CONFIG_DIR/conns" ]'
 chk "e2e: refused connect logged" \
     'grep -q "CONNECT 127.0.0.1:1 failed" "$CONFIG_DIR/proxy.log"'
+# status -w under a real pseudo-terminal must keep redrawing (>= 2 snapshots
+# in ~3s at a 1s interval) instead of exiting after the first frame
+SCRIPT="$SCRIPT" python3 - <<'PYEOF'
+import os, pty, signal, subprocess, sys, time
+m, s = pty.openpty()
+p = subprocess.Popen(['bash', os.environ['SCRIPT'], 'status', '-w', '1'],
+                     stdin=s, stdout=s, stderr=s, env=dict(os.environ))
+time.sleep(3.2)
+p.send_signal(signal.SIGINT)   # Ctrl+C — must hit the cursor-restore trap
+# stop the watcher BEFORE draining, or read() never EOFs
+p.wait(timeout=3)
+os.close(s)
+out = b''
+while True:
+    try:
+        d = os.read(m, 65536)
+        if not d: break
+        out += d
+    except OSError:
+        break
+os.close(m)
+# >= 2 redraws, the live header, and the cursor was restored on Ctrl+C
+if (out.count(b'===== SOCKS5 Proxy Status =====') >= 2 and b'live status' in out
+        and b'\x1b[?25h' in out):
+    print('PASS - e2e: status -w redraws live snapshots')
+    sys.exit(0)
+print('FAIL - e2e: status -w redraws live snapshots')
+sys.exit(1)
+PYEOF
+[ $? -eq 0 ] && ok "e2e: status -w redraws live snapshots" || bad "e2e: status -w redraws live snapshots"
 
 # `reset` restarts the proxy with fresh counters and clears the conns file
 bash "$SCRIPT" reset >/dev/null 2>&1
