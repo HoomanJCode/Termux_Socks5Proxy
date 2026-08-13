@@ -27,7 +27,7 @@ CYAN=$'\033[0;36m'    # cyan   — informational log lines (connections)
 NC=$'\033[0m'         # no color — resets formatting back to default
 
 # Current version of this tool (shown by `socks5-proxy --version`)
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # ----------------------------------------------------------------------------
 # Configuration paths
