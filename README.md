@@ -191,8 +191,11 @@ proper SOCKS5 reply code (0x05 refused, 0x04 unreachable, 0x01 general).
 The log level (default `warning`, so the log only shows problems — failed
 connects, rejected clients, errors) can be raised to `info` to also record
 every connection or `debug` for full verbosity, or lowered to `error` to only
-keep genuine failures. The startup banner is always logged so `logs` still
-confirms the proxy is running at any level. Changes apply on restart.
+keep genuine failures. At `debug`, each tunnel also logs why it ended
+(`up=eof|idle|reset|teardown down=...`) with the bytes relayed and duration —
+so you can tell whether the proxy closed it (idle) or a peer did (eof/reset).
+The startup banner is always logged so `logs` still confirms the proxy is
+running at any level. Changes apply on restart.
 
 ## Testing
 
