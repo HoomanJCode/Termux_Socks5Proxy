@@ -12,8 +12,9 @@ connection details. Later runs start instantly with the saved settings.
 
 - 📌 Remembers the port and listening IP (stored in a config file)
 - 📶 Auto-detects your Wi-Fi/LAN IP address
-- 🎛️ Full CLI: `start`, `stop`, `status`, `logs`, `set port`, `set ip`,
-  `set auth`, `show config`, `--version`
+- 🎛️ Full CLI: `start`, `stop`, `restart`, `reset`, `status`, `logs`,
+  `set port`, `set ip`, `set auth`, `set idle`, `set maxconns`,
+  `show config`, `--version`
 - 🐍 Self-contained Python SOCKS5 server (RFC 1928), generated on first run
 - 🔄 Handles IPv4, domain names, and IPv6 — as CONNECT targets **and** as the
   listening address (`set ip ::` = dual-stack)
@@ -21,7 +22,13 @@ connection details. Later runs start instantly with the saved settings.
   through the proxy too, with multiple concurrent clients supported
 - 🛡️ Restarts cleanly — a PID file tracks the running proxy, and a previous
   instance is verified and stopped before starting a new one
-- 🧵 Per-connection threading, partial-read safe, `sendall`-based relay
+- 🧵 Per-connection threading, partial-read safe, `sendall`-based relay,
+  and graceful half-closes — a client that finished sending but is still
+  reading (e.g. a download) keeps receiving the full reply
+- ⏱️ Idle timeout (default 600s) — connections with no traffic are closed,
+  and a configurable connection cap (default 256) rejects floods
+- 📝 Failures are logged to `proxy.log` (rotated at 1 MiB), and CONNECT
+  errors return the proper SOCKS5 reply code (refused vs unreachable)
 - ⚡ Performance-tuned: 64 KiB relay buffers, `TCP_NODELAY`, and larger
   kernel socket buffers for low-latency, high-throughput transfers
 - 🔒 Optional username/password authentication (RFC 1929), off by default,
@@ -94,13 +101,19 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 | `socks5-proxy` | Start the proxy (uses the saved port & IP) |
 | `socks5-proxy 9999` | Start on port 9999 (and save it) |
 | `socks5-proxy stop` | Stop the running proxy |
+| `socks5-proxy restart` | Stop and start again (applies saved changes) |
+| `socks5-proxy reset` | Restart with fresh traffic counters (clears stats + conns) |
 | `socks5-proxy status` | Show running state + saved settings + live stats (bytes, recent connections) |
 | `socks5-proxy logs` | Show the proxy log (follows live while running) |
 | `socks5-proxy set port 1080` | Save the listening port |
 | `socks5-proxy set ip 192.168.1.10` | Save the listening IP (`0.0.0.0` = all IPv4 interfaces, `::` = all IPv4 + IPv6) |
 | `socks5-proxy set auth myuser` | Enable auth — you'll be prompted for the password (hidden) |
 | `socks5-proxy set auth myuser mypass` | Enable auth with an explicit password |
+| `socks5-proxy set idle 900` | Close connections idle for 15 minutes (default 600s) |
+| `socks5-proxy set maxconns 64` | Allow at most 64 simultaneous connections (default 256) |
 | `socks5-proxy unset auth` | Disable authentication |
+| `socks5-proxy unset idle` | Restore the default idle timeout |
+| `socks5-proxy unset maxconns` | Restore the default connection limit |
 | `socks5-proxy show config` | Show the saved port, IP, and auth state |
 | `socks5-proxy --version` | Print the version |
 
@@ -134,16 +147,18 @@ curl --socks5 <USER>:<PASS>@<PHONE_IP>:<PORT> https://api.ipify.org
 | Watch connections | `socks5-proxy logs` |
 | Change port | `socks5-proxy set port 1080` |
 | Change listening IP | `socks5-proxy set ip 0.0.0.0` |
+| Apply changes while running | `socks5-proxy restart` |
+| Clear traffic counters | `socks5-proxy reset` |
 | Uninstall | `bash install.sh --uninstall && rm -rf $PREFIX/etc/socks5-proxy` |
 
 ## How it works
 
 | File | Purpose |
 |------|---------|
-| `$PREFIX/etc/socks5-proxy/config` | Remembers the port, listening IP, and auth user (permissions 600) |
+| `$PREFIX/etc/socks5-proxy/config` | Saved settings: port, IP, auth user/pass, idle timeout, max connections (permissions 600) |
 | `$PREFIX/etc/socks5-proxy/socks5_server.py` | The generated Python SOCKS5 server |
 | `$PREFIX/etc/socks5-proxy/pid` | PID of the currently running proxy |
-| `$PREFIX/etc/socks5-proxy/proxy.log` | Proxy output (view with `socks5-proxy logs`) |
+| `$PREFIX/etc/socks5-proxy/proxy.log` | Proxy output (view with `socks5-proxy logs`; rotated to `proxy.log.1` past 1 MiB) |
 | `$PREFIX/etc/socks5-proxy/stats` | Live stats for `status` (uptime, connections, bytes) |
 | `$PREFIX/etc/socks5-proxy/conns` | Recent connections with bytes relayed (for `status`) |
 
@@ -154,6 +169,14 @@ each datagram to its client's own relay thread, so concurrent UDP clients
 never steal each other's packets. `status` reads the live stats file written
 by the server every couple of seconds, plus a list of recent connections
 with how many bytes were relayed in each direction.
+
+A relay that moves no data for the idle timeout (default 600s) is closed to
+free its thread and sockets, and once the connection cap (default 256) is
+reached new clients are closed without a handshake. TCP tunnels propagate
+half-closes: when one side stops sending, the proxy signals that with a FIN
+instead of tearing the whole tunnel down, so the other side's remaining data
+still gets through. CONNECT failures are logged to `proxy.log` and return the
+proper SOCKS5 reply code (0x05 refused, 0x04 unreachable, 0x01 general).
 
 ## Testing
 
