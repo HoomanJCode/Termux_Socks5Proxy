@@ -858,6 +858,186 @@ PYEOF
 [ $? -eq 0 ] && ok "connection type matrix passed" || bad "connection type matrix failed"
 
 # ---------------------------------------------------------------------------
+echo "=== 4g. connection stability (idle vs active, bursts, backpressure) ==="
+SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+# TCP echo sink
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(16)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        try: d = c.recv(65536)
+        except OSError: return
+        if not d: break
+        c.sendall(d)
+    try: c.close()
+    except OSError: pass
+def loop():
+    while True:
+        try: c, _ = sink.accept()
+        except OSError: return
+        threading.Thread(target=echo, args=(c,), daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
+
+# Short idle timeout (4s) so stability behavior is observable quickly:
+# anything that survives past ~4s of quiet proves the proxy is not
+# over-eagerly killing connections.
+env = dict(os.environ, SOCKS5_IDLE_TIMEOUT='4')
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      '19370', '127.0.0.1'], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1)
+chk("stab: proxy starts (idle=4s)", p.poll() is None)
+
+def connect():
+    s = socket.create_connection(('127.0.0.1', 19370), timeout=5)
+    s.sendall(b'\x05\x01\x00')
+    assert s.recv(2) == b'\x05\x00'
+    s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1')
+              + struct.pack('>H', tport))
+    assert s.recv(10)[1] == 0x00
+    return s
+
+# --- A: idle-but-within-timeout: a quiet connection stays alive & resumable
+s = connect()
+s.sendall(b'hello')
+chk("stab: initial echo works", s.recv(5) == b'hello')
+time.sleep(1.5)                        # quiet, but under the 4s timeout
+s.sendall(b'world')
+resumed = False
+try:
+    s.settimeout(5)
+    resumed = s.recv(5) == b'world'
+except (socket.timeout, ConnectionResetError, OSError):
+    resumed = False
+chk("stab: survives idle-under-timeout and resumes", resumed)
+
+# --- B: periodic activity resets the idle timer (never kill a busy conn)
+t0 = time.time()
+pings_ok = True
+while time.time() - t0 < 8:            # 8s total, 2x the 4s idle window
+    s.sendall(b'ping')
+    try:
+        s.settimeout(5)
+        if s.recv(4) != b'ping':
+            pings_ok = False
+            break
+    except (socket.timeout, ConnectionResetError, OSError):
+        pings_ok = False
+        break
+    time.sleep(2)                      # 2s of quiet between pings
+chk("stab: active conn outlives idle timeout (pings reset timer)", pings_ok)
+
+# --- C: idle enforcement still works once traffic actually stops
+s.settimeout(7)
+closed = False
+try:
+    closed = s.recv(1) == b''
+except (ConnectionResetError, OSError):
+    closed = True
+chk("stab: quiet conn still closed by idle timeout", closed)
+s.close()
+
+# --- D: sustained bidirectional stream with integrity over time
+s = connect()
+stream_ok = True
+for i in range(20):
+    chunk = os.urandom(16 * 1024)
+    s.sendall(chunk)
+    got = b''
+    try:
+        while len(got) < len(chunk):
+            d = s.recv(65536)
+            if not d:
+                raise EOFError
+            got += d
+    except (EOFError, ConnectionResetError, socket.timeout, OSError):
+        stream_ok = False
+        break
+    if got != chunk:
+        stream_ok = False
+        break
+    time.sleep(0.05)
+chk("stab: sustained stream (20x16KiB) stays intact", stream_ok)
+
+# --- E: slow reader (backpressure) — no drops, no premature close
+s.settimeout(None)
+big = os.urandom(256 * 1024)
+s.sendall(big)
+got = b''
+try:
+    while len(got) < len(big):
+        d = s.recv(8192)
+        if not d:
+            break
+        got += d
+        time.sleep(0.005)              # read slowly — tunnel must pace us
+except (ConnectionResetError, OSError):
+    pass
+chk("stab: slow reader receives all 256KiB (backpressure ok)", got == big)
+s.close()
+
+# --- F: many sequential connections — no fd leak or degradation
+seq_ok = True
+for i in range(30):
+    try:
+        c = connect()
+        c.sendall(b'seq')
+        c.settimeout(3)
+        if c.recv(3) != b'seq':
+            seq_ok = False
+            break
+        c.close()
+    except (OSError, AssertionError):
+        seq_ok = False
+        break
+chk("stab: 30 sequential connections all succeed", seq_ok)
+
+# --- G: concurrent long-lived connections persist together, no cross-talk
+conns = []
+for i in range(6):
+    c = connect()
+    conns.append((c, b'c%d' % i))
+for c, tag in conns:
+    c.sendall(tag)
+for c, tag in conns:
+    try:
+        c.settimeout(5)
+        if c.recv(len(tag)) != tag:
+            raise ValueError
+    except (ValueError, OSError, socket.timeout):
+        pass
+all_ok = True
+time.sleep(2)                          # hold them all open together
+for c, tag in conns:
+    try:
+        c.sendall(tag)
+        c.settimeout(5)
+        if c.recv(len(tag)) != tag:
+            all_ok = False
+            break
+    except (OSError, socket.timeout):
+        all_ok = False
+        break
+chk("stab: 6 concurrent conns persist and echo own payload", all_ok)
+for c, _ in conns:
+    c.close()
+
+p.terminate(); p.wait(); sink.close()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "connection stability suite passed" || bad "connection stability suite failed"
+
+# ---------------------------------------------------------------------------
 echo "=== 5. IPv6 listener (skipped if no IPv6 loopback) ==="
 SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
 import os, socket, struct, subprocess, sys, time
