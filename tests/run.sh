@@ -424,10 +424,10 @@ s.sendall(b'domain-ok')
 chk("domain CONNECT relay echo", s.recv(9) == b'domain-ok')
 s.close()
 
-# CONNECT to an unreachable target -> REP 0x01 (general failure)
+# CONNECT to a refused target (nothing listens on port 1) -> REP 0x05
 s = connect()
 s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', 1))
-chk("unreachable target -> REP 0x01", s.recv(10)[1] == 0x01)
+chk("refused target -> REP 0x05", s.recv(10)[1] == 0x05)
 s.close()
 
 # Wrong SOCKS version -> connection closed without a reply. The server may
@@ -500,11 +500,118 @@ while len(got) < len(big):
 chk("1 MiB payload round-trips intact", got == big)
 s.close()
 
+# Half-close regression: a client that finishes sending (shutdown SHUT_WR)
+# but keeps reading must still receive the FULL reply. The proxy has to
+# propagate the half-close instead of closing the whole tunnel (which would
+# truncate in-flight downloads).
+s = connect()
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+payload = b'half-close-' * 4096   # ~45 KiB — spans many relay loops
+s.sendall(payload)
+s.shutdown(socket.SHUT_WR)        # done sending — still reading
+half_got = b''
+while len(half_got) < len(payload):
+    d = s.recv(65536)
+    if not d:
+        break   # proxy closed too early — the bug this guards against
+    half_got += d
+chk("half-close: full reply delivered after client shutdown", half_got == payload)
+s.close()
+
 p.terminate(); p.wait(); sink.close()
 print("RESULT: %d passed, %d failed" % (pass_, fail))
 sys.exit(1 if fail else 0)
 PYEOF
 [ $? -eq 0 ] && ok "extended protocol suite passed" || bad "extended protocol suite failed"
+
+# ---------------------------------------------------------------------------
+echo "=== 4e. limits (idle timeout, connection cap) ==="
+SOCKS5_STATS="$CONFIG_DIR/stats" python3 - "$TMP" <<'PYEOF'
+import os, socket, struct, subprocess, sys, threading, time
+tmp = sys.argv[1]
+pass_, fail = 0, 0
+def chk(n, c):
+    global pass_, fail
+    if c: pass_ += 1; print("PASS - %s" % n)
+    else: fail += 1; print("FAIL - %s" % n)
+
+# TCP echo sink
+sink = socket.socket(); sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sink.bind(('127.0.0.1', 0)); sink.listen(16)
+tport = sink.getsockname()[1]
+def echo(c):
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        c.sendall(d)
+    c.close()
+def loop():
+    while True:
+        try: c, _ = sink.accept()
+        except OSError: return
+        threading.Thread(target=echo, args=(c,), daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
+
+def handshake(port):
+    s = socket.create_connection(('127.0.0.1', port), timeout=5)
+    s.sendall(b'\x05\x01\x00'); assert s.recv(2) == b'\x05\x00'
+    return s
+
+# --- idle timeout: a connection that goes quiet is closed by the proxy
+env = dict(os.environ, SOCKS5_IDLE_TIMEOUT='2')
+p = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                      '19361', '127.0.0.1'], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1)
+chk("limit: idle proxy starts", p.poll() is None)
+
+s = handshake(19361)
+s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', tport))
+assert s.recv(10)[1] == 0x00
+s.settimeout(6)
+closed = False
+try:
+    closed = s.recv(1) == b''
+except (ConnectionResetError, socket.timeout):
+    closed = True
+chk("limit: idle connection closed by proxy", closed)
+s.close()
+
+# --- connection cap: MAX_CONNS=1 rejects extras, then frees the slot
+env2 = dict(os.environ, SOCKS5_MAX_CONNS='1')
+p2 = subprocess.Popen([sys.executable, os.path.join(tmp, 'server.py'),
+                       '19362', '127.0.0.1'], env=env2,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1)
+chk("limit: capped proxy starts", p2.poll() is None)
+
+a = socket.create_connection(('127.0.0.1', 19362), timeout=5)   # fills the slot
+b = socket.create_connection(('127.0.0.1', 19362), timeout=5)   # must be closed
+b.settimeout(3)
+rejected = False
+try:
+    rejected = b.recv(1) == b''
+except (ConnectionResetError, OSError):
+    rejected = True
+chk("limit: extra connection rejected at cap", rejected)
+# the client that already holds the slot still works
+b.close()
+a.sendall(b'\x05\x01\x00')
+chk("limit: existing connection unaffected", a.recv(2) == b'\x05\x00')
+a.close()
+time.sleep(0.5)
+# once a slot frees up, new clients are accepted again
+c = socket.create_connection(('127.0.0.1', 19362), timeout=5)
+c.sendall(b'\x05\x01\x00')
+chk("limit: slot reused after client disconnects", c.recv(2) == b'\x05\x00')
+c.close()
+
+p.terminate(); p.wait(); p2.terminate(); p2.wait(); sink.close()
+print("RESULT: %d passed, %d failed" % (pass_, fail))
+sys.exit(1 if fail else 0)
+PYEOF
+[ $? -eq 0 ] && ok "limits suite passed" || bad "limits suite failed"
 
 # ---------------------------------------------------------------------------
 echo "=== 5. IPv6 listener (skipped if no IPv6 loopback) ==="
@@ -687,6 +794,20 @@ chk "unset auth cleans both keys" \
     'bash "$SCRIPT" unset auth >/dev/null 2>&1 && ! grep -q "^PROXY_USER=\|^PROXY_PASS=" "$CONFIG_FILE"'
 # format_uptime / format_bytes are pure bash helpers. The uptime checks use
 # range regexes because a second can tick between the arg's `date +%s` and
+# set/unset idle and maxconns validate, save, and restore config keys
+chk "set idle saves config" \
+    'bash "$SCRIPT" set idle 60 >/dev/null 2>&1 && grep -q "^IDLE_TIMEOUT=60$" "$CONFIG_FILE"'
+chk "set idle rejects <10" \
+    '! bash "$SCRIPT" set idle 5 >/dev/null 2>&1'
+chk "set maxconns saves config" \
+    'bash "$SCRIPT" set maxconns 100 >/dev/null 2>&1 && grep -q "^MAX_CONNS=100$" "$CONFIG_FILE"'
+chk "set maxconns rejects 0" \
+    '! bash "$SCRIPT" set maxconns 0 >/dev/null 2>&1'
+chk "unset idle restores default" \
+    'bash "$SCRIPT" unset idle >/dev/null 2>&1 && ! grep -q "^IDLE_TIMEOUT=" "$CONFIG_FILE"'
+chk "unset maxconns restores default" \
+    'bash "$SCRIPT" unset maxconns >/dev/null 2>&1 && ! grep -q "^MAX_CONNS=" "$CONFIG_FILE"'
+
 # the one computed inside format_uptime (90s -> "1m 30s" or "1m 31s").
 chk "format_uptime seconds"    '[[ "$(format_uptime $(date +%s))" =~ ^(0s|1s)$ ]]'
 chk "format_uptime minutes"    '[[ "$(format_uptime $(( $(date +%s) - 90 )))" =~ ^1m[[:space:]][0-9]+s$ ]]'
@@ -751,6 +872,12 @@ s.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H'
 assert s.recv(10)[1] == 0x00
 s.sendall(b'e2e-bytes')
 assert s.recv(9) == b'e2e-bytes'
+# a refused target gets REP 0x05 and a line in the proxy log
+r = socket.create_connection(('127.0.0.1', 19310), timeout=5)
+r.sendall(b'\x05\x01\x00'); assert r.recv(2) == b'\x05\x00'
+r.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('>H', 1))
+assert r.recv(10)[1] == 0x05
+r.close()
 s.close(); sink.close()
 time.sleep(3)   # let the stats writer flush the conns file
 PYEOF
@@ -770,6 +897,36 @@ chk "e2e: status shows recent connections" \
     'bash "$SCRIPT" status | strip_colors | grep -q "Recent connections"'
 chk "e2e: conns file written" \
     '[ -f "$CONFIG_DIR/conns" ]'
+chk "e2e: refused connect logged" \
+    'grep -q "CONNECT 127.0.0.1:1 failed" "$CONFIG_DIR/proxy.log"'
+
+# `reset` restarts the proxy with fresh counters and clears the conns file
+bash "$SCRIPT" reset >/dev/null 2>&1
+sleep 3
+RESET_PID=$(cat "$CONFIG_DIR/pid" 2>/dev/null || echo "")
+chk "e2e: reset restarts the proxy" \
+    '[ -n "$RESET_PID" ] && bash "$SCRIPT" status | strip_colors | grep -q "Running: yes"'
+chk "e2e: reset clears conns file" \
+    '[ ! -s "$CONFIG_DIR/conns" ]'
+
+# the `restart` command replaces the running proxy in one step
+bash "$SCRIPT" restart >/dev/null 2>&1
+sleep 3
+RESTART_PID=$(cat "$CONFIG_DIR/pid" 2>/dev/null || echo "")
+chk "e2e: restart command replaces proxy" \
+    '[ -n "$RESTART_PID" ] && [ "$RESTART_PID" != "$RESET_PID" ] && bash "$SCRIPT" status | strip_colors | grep -q "Running: yes"'
+
+# log rotation: a proxy.log over 1 MiB is moved aside on the next start
+bash "$SCRIPT" stop >/dev/null 2>&1
+sleep 1
+python3 -c "open('$CONFIG_DIR/proxy.log','w').write('x'*2097152)"
+bash "$SCRIPT" start >/dev/null 2>&1
+sleep 3
+chk "e2e: oversized log rotated to proxy.log.1" \
+    '[ -f "$CONFIG_DIR/proxy.log.1" ]'
+chk "e2e: fresh log written after rotation" \
+    'grep -q "SOCKS5 proxy running" "$CONFIG_DIR/proxy.log"'
+
 bash "$SCRIPT" stop >/dev/null 2>&1
 sleep 1
 chk "e2e: status shows stopped" \
