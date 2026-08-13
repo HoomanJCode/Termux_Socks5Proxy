@@ -13,7 +13,7 @@ connection details. Later runs start instantly with the saved settings.
 - 📌 Remembers the port and listening IP (stored in a config file)
 - 📶 Auto-detects your Wi-Fi/LAN IP address
 - 🎛️ Full CLI: `start`, `stop`, `restart`, `reset`, `status`, `logs`,
-  `set port`, `set ip`, `set auth`, `set idle`, `set maxconns`,
+  `set port`, `set ip`, `set auth`, `set idle`, `set maxconns`, `set loglevel`,
   `show config`, `--version`
 - 🐍 Self-contained Python SOCKS5 server (RFC 1928), generated on first run
 - 🔄 Handles IPv4, domain names, and IPv6 — as CONNECT targets **and** as the
@@ -118,10 +118,12 @@ Run `socks5-proxy help` (`-h` / `--help` also work) for the full help screen.
 | `socks5-proxy set auth myuser mypass` | Enable auth with an explicit password |
 | `socks5-proxy set idle 900` | Close connections idle for 15 minutes (default 600s) |
 | `socks5-proxy set maxconns 64` | Allow at most 64 simultaneous connections (default 256) |
+| `socks5-proxy set loglevel info` | Log verbosity: `debug`, `info`, `warning`, `error` (default `warning`) |
 | `socks5-proxy unset auth` | Disable authentication |
 | `socks5-proxy unset idle` | Restore the default idle timeout |
 | `socks5-proxy unset maxconns` | Restore the default connection limit |
-| `socks5-proxy show config` | Show the saved port, IP, and auth state |
+| `socks5-proxy unset loglevel` | Restore the default log level (warning) |
+| `socks5-proxy show config` | Show the saved port, IP, auth state, and log level |
 | `socks5-proxy --version` | Print the version |
 
 ### Configure your other devices
@@ -162,7 +164,7 @@ curl --socks5 <USER>:<PASS>@<PHONE_IP>:<PORT> https://api.ipify.org
 
 | File | Purpose |
 |------|---------|
-| `$PREFIX/etc/socks5-proxy/config` | Saved settings: port, IP, auth user/pass, idle timeout, max connections (permissions 600) |
+| `$PREFIX/etc/socks5-proxy/config` | Saved settings: port, IP, auth user/pass, idle timeout, max connections, log level (permissions 600) |
 | `$PREFIX/etc/socks5-proxy/socks5_server.py` | The generated Python SOCKS5 server |
 | `$PREFIX/etc/socks5-proxy/pid` | PID of the currently running proxy |
 | `$PREFIX/etc/socks5-proxy/proxy.log` | Proxy output (view with `socks5-proxy logs`; rotated to `proxy.log.1` past 1 MiB) |
@@ -184,6 +186,12 @@ half-closes: when one side stops sending, the proxy signals that with a FIN
 instead of tearing the whole tunnel down, so the other side's remaining data
 still gets through. CONNECT failures are logged to `proxy.log` and return the
 proper SOCKS5 reply code (0x05 refused, 0x04 unreachable, 0x01 general).
+
+The log level (default `warning`, so the log only shows problems — failed
+connects, rejected clients, errors) can be raised to `info` to also record
+every connection or `debug` for full verbosity, or lowered to `error` to only
+keep genuine failures. The startup banner is always logged so `logs` still
+confirms the proxy is running at any level. Changes apply on restart.
 
 ## Testing
 
