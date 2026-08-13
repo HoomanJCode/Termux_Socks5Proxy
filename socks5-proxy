@@ -1064,10 +1064,38 @@ def handle_client(client_socket):
                         except OSError:
                             pass
                         break
-                    dst.sendall(data)   # sendall: never silently truncates
+                    # Sending must never die from a slow peer. The 1s socket
+                    # timeout (set above for idle detection) also applies to
+                    # send(), so a large write into a momentarily-closed
+                    # receive window would raise socket.timeout — an OSError
+                    # subclass the handler below would read as a reset and
+                    # use to kill this direction mid-transfer. Retry instead:
+                    # nothing is queued on a timeout, so no bytes are lost.
+                    size = len(data)
+                    while data:
+                        try:
+                            data = data[dst.send(data):]
+                        except socket.timeout:
+                            if done.is_set():
+                                break
+                            if state['left'] < 2:
+                                # the other direction already ended
+                                done.set()
+                                reason = 'teardown'
+                                break
+                            if time.time() - state['last'] > IDLE_TIMEOUT:
+                                done.set()   # idle too long — wind everything down
+                                reason = 'idle'
+                                break
+                            continue
+                    if data:
+                        # wound down mid-send (peer stalled / direction ended)
+                        if reason == 'eof':
+                            reason = 'teardown'
+                        break
                     with _stats_lock:
                         state['last'] = time.time()
-                        counters[direction] += len(data)
+                        counters[direction] += size
             except OSError:
                 reason = 'reset'   # connection reset / closed — stop copying
             finally:
