@@ -311,6 +311,7 @@ ${GREEN}COMMANDS${NC}
     restart              Stop and start the proxy again
     reset                Restart and clear traffic counters (stats + conns)
     status               Show running state + saved settings + live stats
+    status -w [secs]     Live status, re-drawn every N seconds (default 2)
     logs                 Show the proxy log (follows when running)
     set port <1-65535>   Save the listening port
     set ip <IP>          Save the listening IP (IPv4 or IPv6 literal)
@@ -342,6 +343,8 @@ ${GREEN}EXAMPLES${NC}
     socks5-proxy restart          Apply saved changes without stopping first
     socks5-proxy reset            Restart with fresh traffic counters
     socks5-proxy status           Check whether the proxy is running
+    socks5-proxy status -w        Watch traffic live (refresh every 2s)
+    socks5-proxy status -w 1      Watch with a 1-second refresh
     socks5-proxy logs             Watch live connections
     socks5-proxy stop             Stop the running proxy
 
@@ -1335,6 +1338,35 @@ show_status() {
 }
 
 # ----------------------------------------------------------------------------
+# show_status_watch — live-refreshing status, re-drawn every $1 seconds
+#   (default 2, matching the server's stats-file cadence).
+#   When stdout is not a terminal (pipes, scripts) it prints one snapshot and
+#   returns, so nothing ever hangs non-interactively.
+# ----------------------------------------------------------------------------
+show_status_watch() {
+    local interval="${1:-2}"
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ] || [ "$interval" -gt 60 ]; then
+        echo -e "${RED}❌ Invalid interval: '$interval' (must be a number from 1 to 60 seconds)${NC}"
+        exit 1
+    fi
+    if [ ! -t 1 ]; then
+        # Not a terminal — a single snapshot is enough (scripts must not hang)
+        show_status
+        return 0
+    fi
+    # Restore the cursor and exit cleanly on Ctrl+C
+    trap 'printf "\033[?25h"; exit 0' INT TERM
+    printf '\033[?25l'   # hide the cursor while refreshing
+    while true; do
+        printf '\033[2J\033[H'   # clear screen + move cursor home
+        echo -e "${BLUE}● live status — refresh every ${interval}s — Ctrl+C to exit${NC}"
+        echo -e "${YELLOW}  $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+        show_status
+        sleep "$interval"
+    done
+}
+
+# ----------------------------------------------------------------------------
 # show_logs — show the proxy's log output
 #   Follows live (tail -f) when running; shows the last lines otherwise
 # ----------------------------------------------------------------------------
@@ -1504,7 +1536,14 @@ case "$CMD" in
         start_proxy "$2"
         ;;
     status)
-        show_status
+        case "${2:-}" in
+            -w|--watch) show_status_watch "${3:-}" ;;
+            "")        show_status ;;
+            *)
+                echo -e "${RED}❌ Usage: socks5-proxy status [--watch [<interval-secs>]]${NC}"
+                exit 1
+                ;;
+        esac
         ;;
     logs)
         show_logs
