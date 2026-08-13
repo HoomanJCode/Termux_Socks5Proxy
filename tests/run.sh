@@ -782,6 +782,23 @@ chk "help renders" \
     'bash "$SCRIPT" help | strip_colors | grep -q "COMMANDS"'
 chk "logs with no log file is harmless" \
     'bash "$SCRIPT" logs | strip_colors | grep -q "No log file"'
+# colorize_log (used by `logs --color`) maps log lines to colors by level
+chk "colorize_log: errors red" \
+    'echo "Error handling client: boom" | colorize_log | grep -qF "$RED"'
+chk "colorize_log: warnings yellow" \
+    'echo "CONNECT host:1 failed: timed out" | colorize_log | grep -qF "$YELLOW"'
+chk "colorize_log: rejected yellow" \
+    'echo "Rejected connection from 1.2.3.4:5 (limit 256 reached)" | colorize_log | grep -qF "$YELLOW"'
+chk "colorize_log: connections cyan" \
+    'echo "Connection from 127.0.0.1:1234" | colorize_log | grep -qF "$CYAN"'
+chk "colorize_log: banner green" \
+    'echo "SOCKS5 proxy running on 0.0.0.0:10806" | colorize_log | grep -qF "$GREEN"'
+chk "colorize_log: plain lines untouched" \
+    '[ "$(echo "some other line" | colorize_log)" = "some other line" ]'
+chk "logs --color forces color when piped" \
+    'echo "CONNECT x:1 failed: nope" > "$CONFIG_DIR/proxy.log" && bash "$SCRIPT" logs --color 2>/dev/null | grep -qF "${YELLOW}CONNECT x:1 failed"'
+chk "logs stays plain when piped" \
+    '! bash "$SCRIPT" logs 2>/dev/null | grep -qF "${YELLOW}CONNECT x:1 failed"'
 chk "stop with no pid file is harmless" \
     'bash "$SCRIPT" stop | strip_colors | grep -q "not running"'
 # Hidden password prompt: `set auth user` with no password argument reads it
