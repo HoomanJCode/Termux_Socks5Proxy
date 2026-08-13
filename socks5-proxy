@@ -1263,16 +1263,9 @@ echo -e "   Change port: ${GREEN}socks5-proxy set port <PORT>${NC}"
 echo -e "   Change IP:   ${GREEN}socks5-proxy set ip <IP>${NC}"
 echo -e "   Uninstall:   ${GREEN}rm -rf $CONFIG_DIR && rm $PREFIX/bin/socks5-proxy${NC}"
 echo -e ""
-echo -e "${YELLOW}Press Ctrl+C to exit (proxy stays running)${NC}"
 
-# 10) Keep the script alive so the user can read the output; `wait` blocks
-#     until the background proxy is killed. Only do this in an interactive
-#     terminal — when stdin is not a TTY (scripts, e2e tests, cron) the
-#     launcher returns immediately and the proxy keeps running in the
-#     background, so `start`/`restart`/`reset` never hang a script.
-if [ -t 0 ]; then
-    wait
-fi
+# 10) The proxy is already detached (new session, nohup), so `start` returns
+#     to the prompt immediately — Ctrl+C on the terminal never touches it.
 }
 
 # ----------------------------------------------------------------------------
